@@ -49,6 +49,7 @@ Add an entry to your `.mcp.json` file (in your project root or `~/.mcp.json` for
       "args": ["-y", "@deotio/mcp-sigv4-proxy"],
       "env": {
         "AWS_PROFILE": "your-profile-name",
+        "AWS_REGION": "us-east-1",
         "MCP_SERVER_URL": "https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/your-runtime-id/invocations?qualifier=DEFAULT"
       }
     }
@@ -56,7 +57,7 @@ Add an entry to your `.mcp.json` file (in your project root or `~/.mcp.json` for
 }
 ```
 
-The service name and region are inferred from the URL automatically. You only need `AWS_PROFILE` and `MCP_SERVER_URL`.
+Always set `AWS_REGION` explicitly — the proxy can infer it from the URL, but your shell's `AWS_REGION` takes precedence and may point to a different region. `AWS_SERVICE` is inferred automatically.
 
 ## Step 4: Test the connection
 

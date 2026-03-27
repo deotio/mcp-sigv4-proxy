@@ -14,12 +14,13 @@ Add to your `.mcp.json`:
   "args": ["-y", "@deotio/mcp-sigv4-proxy"],
   "env": {
     "AWS_PROFILE": "dot-finops",
+    "AWS_REGION": "us-east-1",
     "MCP_SERVER_URL": "https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/.../invocations?qualifier=DEFAULT"
   }
 }
 ```
 
-The service name (`bedrock-agentcore`) and region (`us-east-1`) are inferred from the URL automatically. Set `AWS_REGION` and `AWS_SERVICE` only when using non-standard endpoints.
+Always set `AWS_REGION` explicitly — the proxy can infer it from standard AWS hostnames, but `AWS_REGION` from your shell environment takes precedence and may point to a different region. `AWS_SERVICE` is inferred automatically and only needs to be set for non-standard endpoints.
 
 ## How it works
 

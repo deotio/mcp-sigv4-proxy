@@ -35,19 +35,21 @@ If omitted, the SDK falls back to its default credential resolution order:
 
 In practice, you almost always want to set this — it's the main reason to use this proxy over a direct HTTP transport.
 
-### `AWS_REGION` (optional, usually auto-detected)
+### `AWS_REGION` (recommended)
 
 The AWS region used in the SigV4 signing process. Must match the region of the target service endpoint.
 
 ```json
-"AWS_REGION": "eu-west-1"
+"AWS_REGION": "us-east-1"
 ```
 
-The proxy infers the region from standard AWS endpoint hostnames automatically:
+The proxy can infer the region from standard AWS endpoint hostnames:
 - `bedrock-agentcore.us-east-1.amazonaws.com` -> `us-east-1`
 - `service.eu-west-1.api.aws` -> `eu-west-1`
 
-You only need to set this if the hostname doesn't follow a standard pattern. If neither the env var nor inference produces a value, the default is `us-east-1`.
+However, **always set `AWS_REGION` explicitly** in your `.mcp.json` `env` block. MCP clients typically inherit the parent shell's environment, so if your shell has `AWS_REGION=eu-central-1` (e.g. for a different project), that value will override the inference and cause a "Credential should be scoped to a valid region" error. Setting it explicitly in `env` prevents this.
+
+If neither the env var nor inference produces a value, the default is `us-east-1`.
 
 ### `AWS_SERVICE` (optional, usually auto-detected)
 

@@ -20,12 +20,34 @@ Something in your environment has set `NODE_TLS_REJECT_UNAUTHORIZED=0`, which di
 
 ## Authentication errors
 
-### `mcp-sigv4-proxy: HTTP 403: ...`
+### `mcp-sigv4-proxy: HTTP 403: {"message":"Credential should be scoped to a valid region."}`
+
+The SigV4 signing region doesn't match what the service expects. This usually happens when `AWS_REGION` from your shell environment (e.g. `eu-central-1` for a different project) leaks into the proxy and overrides the region inferred from the URL.
+
+**Fix:** Always set `AWS_REGION` explicitly in your `.mcp.json` `env` block to match the endpoint's region:
+
+```json
+"env": {
+  "AWS_REGION": "us-east-1",
+  "MCP_SERVER_URL": "https://bedrock-agentcore.us-east-1.amazonaws.com/..."
+}
+```
+
+### `mcp-sigv4-proxy: HTTP 403: {"message":"The request signature we calculated does not match..."}`
+
+The request was signed but the signature doesn't match what the server computed. This was caused by a bug in versions prior to 0.2.1 where the URL query string (e.g. `?qualifier=DEFAULT`) was included in the path component during signing instead of being passed as a separate query parameter. **Upgrade to 0.2.1+** to fix this.
+
+If you're already on 0.2.1+ and still see this error:
+
+- **Clock skew** — SigV4 signatures include a timestamp. If your system clock is off by more than 5 minutes, requests will be rejected. Check with `date` and sync if needed.
+- **Wrong service name** — `AWS_SERVICE` doesn't match what the endpoint expects. Try `bedrock-agentcore` (the default) or `bedrock`.
+
+### `mcp-sigv4-proxy: HTTP 403: ...` (other 403 errors)
 
 The request was signed and delivered, but the target service rejected it. Common causes:
 
 - **Wrong IAM permissions** — the principal doesn't have the required action (e.g. `bedrock-agentcore:InvokeAgentRuntime`). Check the IAM policy attached to the user or role.
-- **Wrong region** — `AWS_REGION` doesn't match the endpoint's region. The SigV4 signing region must match the service region.
+- **Wrong region** — `AWS_REGION` doesn't match the endpoint's region. See the "Credential should be scoped to a valid region" entry above.
 - **Wrong service name** — `AWS_SERVICE` doesn't match what the endpoint expects. Try `bedrock-agentcore` (the default) or `bedrock`.
 - **Expired credentials** — if using SSO, re-run `aws sso login --profile your-profile`. If using static credentials, verify they haven't been rotated.
 - **Clock skew** — SigV4 signatures include a timestamp. If your system clock is off by more than 5 minutes, requests will be rejected. Check with `date` and sync if needed.
