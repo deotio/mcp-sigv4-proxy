@@ -5,11 +5,62 @@ import { Sha256 } from '@aws-crypto/sha256-js';
 import readline from 'readline';
 
 export const MAX_SSE_BUFFER_BYTES = 1_048_576; // 1 MB
+const DEFAULT_TIMEOUT_MS = 180_000; // 180s, matches AWS proxy
+const DEFAULT_RETRIES = 0;
+const RETRY_BASE_MS = 1000;
+
+// --- Log levels ---
+
+export type LogLevel = 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR' | 'SILENT';
+
+const LOG_LEVEL_ORDER: Record<LogLevel, number> = {
+  DEBUG: 0,
+  INFO: 1,
+  WARNING: 2,
+  ERROR: 3,
+  SILENT: 4,
+};
+
+let currentLogLevel: LogLevel = 'ERROR';
+
+export function setLogLevel(level: LogLevel): void {
+  currentLogLevel = level;
+}
+
+export function log(level: LogLevel, message: string): void {
+  if (LOG_LEVEL_ORDER[level] >= LOG_LEVEL_ORDER[currentLogLevel]) {
+    process.stderr.write(`mcp-sigv4-proxy: ${message}\n`);
+  }
+}
+
+// --- URL parsing ---
+
+export function parseEndpointUrl(hostname: string): { service: string; region: string } | null {
+  const parts = hostname.split('.');
+
+  // bedrock-agentcore.us-east-1.amazonaws.com
+  if (parts.length >= 4 && parts.at(-2) === 'amazonaws' && parts.at(-1) === 'com') {
+    const service = parts.slice(0, -3).join('.');
+    const region = parts.at(-3)!;
+    if (service && region) return { service, region };
+  }
+
+  // service.region.api.aws
+  if (parts.length === 4 && parts[2] === 'api' && parts[3] === 'aws') {
+    return { service: parts[0], region: parts[1] };
+  }
+
+  return null;
+}
+
+// --- Config ---
 
 export interface ProxyConfig {
   url: URL;
   region: string;
   service: string;
+  timeoutMs: number;
+  retries: number;
 }
 
 export function validateEnv(): ProxyConfig {
@@ -27,18 +78,46 @@ export function validateEnv(): ProxyConfig {
   }
 
   const url = new URL(process.env.MCP_SERVER_URL);
-  if (url.protocol !== 'https:') {
+
+  // Allow http:// for localhost (local development), require https:// for everything else
+  const isLocalhost =
+    url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '::1';
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && isLocalhost)) {
     process.stderr.write(
       `mcp-sigv4-proxy: MCP_SERVER_URL must use https:// (got ${url.protocol})\n`,
     );
     process.exit(1);
   }
 
-  return {
-    url,
-    region: process.env.AWS_REGION ?? 'us-east-1',
-    service: process.env.AWS_SERVICE ?? 'bedrock-agentcore',
-  };
+  // Infer service and region from hostname, fall back to env vars / defaults
+  const inferred = parseEndpointUrl(url.hostname);
+
+  const region = process.env.AWS_REGION || inferred?.region || 'us-east-1';
+  const service = process.env.AWS_SERVICE || inferred?.service || 'bedrock-agentcore';
+
+  // Parse log level
+  const envLogLevel = (process.env.MCP_LOG_LEVEL ?? 'ERROR').toUpperCase();
+  if (envLogLevel in LOG_LEVEL_ORDER) {
+    setLogLevel(envLogLevel as LogLevel);
+  }
+
+  // Parse timeout
+  const timeoutMs = process.env.MCP_TIMEOUT
+    ? Number(process.env.MCP_TIMEOUT) * 1000
+    : DEFAULT_TIMEOUT_MS;
+
+  // Parse retries
+  const retries = process.env.MCP_RETRIES
+    ? Math.min(Math.max(0, Math.floor(Number(process.env.MCP_RETRIES))), 10)
+    : DEFAULT_RETRIES;
+
+  log('INFO', `target: ${url.hostname}, service: ${service}, region: ${region}`);
+  if (inferred) {
+    log('DEBUG', `inferred service=${inferred.service}, region=${inferred.region} from URL`);
+  }
+  log('DEBUG', `timeout: ${timeoutMs}ms, retries: ${retries}`);
+
+  return { url, region, service, timeoutMs, retries };
 }
 
 export function createSigner(config: ProxyConfig): SignatureV4 {
@@ -50,6 +129,8 @@ export function createSigner(config: ProxyConfig): SignatureV4 {
   });
 }
 
+// --- Input parsing ---
+
 export function parseInputLine(line: string): { body: string; requestId: unknown } | null {
   const body = line.trim();
   if (!body) return null;
@@ -58,7 +139,7 @@ export function parseInputLine(line: string): { body: string; requestId: unknown
   try {
     parsed = JSON.parse(body);
   } catch {
-    process.stderr.write('mcp-sigv4-proxy: ignoring non-JSON input line\n');
+    log('WARNING', 'ignoring non-JSON input line');
     return null;
   }
 
@@ -67,13 +148,15 @@ export function parseInputLine(line: string): { body: string; requestId: unknown
     parsed === null ||
     (parsed as Record<string, unknown>).jsonrpc !== '2.0'
   ) {
-    process.stderr.write('mcp-sigv4-proxy: ignoring non-JSON-RPC message\n');
+    log('WARNING', 'ignoring non-JSON-RPC message');
     return null;
   }
 
   const requestId = (parsed as Record<string, unknown>).id ?? null;
   return { body, requestId };
 }
+
+// --- Request building ---
 
 export function buildHttpRequest(url: URL, body: string): HttpRequest {
   return new HttpRequest({
@@ -89,10 +172,67 @@ export function buildHttpRequest(url: URL, body: string): HttpRequest {
   });
 }
 
+// --- Fetch with timeout and retries ---
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  retries: number,
+): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const response = await fetchWithTimeout(url, init, timeoutMs);
+
+      // Only retry on 5xx server errors
+      if (response.status >= 500 && attempt < retries) {
+        log('WARNING', `HTTP ${response.status}, retrying (${attempt + 1}/${retries})`);
+        await sleep(RETRY_BASE_MS * Math.pow(2, attempt));
+        continue;
+      }
+
+      return response;
+    } catch (err) {
+      lastError = err;
+      if (attempt < retries) {
+        const isTimeout =
+          err instanceof DOMException && err.name === 'AbortError';
+        log(
+          'WARNING',
+          `request ${isTimeout ? 'timed out' : 'failed'}, retrying (${attempt + 1}/${retries})`,
+        );
+        await sleep(RETRY_BASE_MS * Math.pow(2, attempt));
+      }
+    }
+  }
+  throw lastError;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// --- Response handling ---
+
 export async function handleResponse(response: Response, requestId: unknown): Promise<void> {
   if (!response.ok) {
     const text = await response.text();
-    process.stderr.write(`mcp-sigv4-proxy: HTTP ${response.status}: ${text}\n`);
+    log('ERROR', `HTTP ${response.status}: ${text}`);
     process.stdout.write(
       JSON.stringify({
         jsonrpc: '2.0',
@@ -118,7 +258,7 @@ export async function handleResponse(response: Response, requestId: unknown): Pr
       buffer += decoder.decode(value, { stream: true });
 
       if (Buffer.byteLength(buffer) > MAX_SSE_BUFFER_BYTES) {
-        process.stderr.write('mcp-sigv4-proxy: SSE buffer exceeded 1 MB limit, aborting stream\n');
+        log('ERROR', 'SSE buffer exceeded 1 MB limit, aborting stream');
         reader.cancel();
         process.stdout.write(
           JSON.stringify({
@@ -140,9 +280,7 @@ export async function handleResponse(response: Response, requestId: unknown): Pr
             JSON.parse(data);
             process.stdout.write(data + '\n');
           } catch {
-            process.stderr.write(
-              `mcp-sigv4-proxy: dropping non-JSON SSE data: ${data.slice(0, 100)}\n`,
-            );
+            log('WARNING', `dropping non-JSON SSE data: ${data.slice(0, 100)}`);
           }
         }
       }
@@ -154,45 +292,56 @@ export async function handleResponse(response: Response, requestId: unknown): Pr
       JSON.parse(trimmed);
       process.stdout.write(trimmed + '\n');
     } catch {
-      process.stderr.write(
-        `mcp-sigv4-proxy: dropping non-JSON response body: ${trimmed.slice(0, 100)}\n`,
-      );
+      log('WARNING', `dropping non-JSON response body: ${trimmed.slice(0, 100)}`);
     }
   }
 }
 
+// --- Request processing ---
+
 export async function processLine(
   line: string,
-  url: URL,
+  config: ProxyConfig,
   signer: SignatureV4,
 ): Promise<void> {
   const input = parseInputLine(line);
   if (!input) return;
 
   const { body, requestId } = input;
-  const request = buildHttpRequest(url, body);
+  const request = buildHttpRequest(config.url, body);
 
   try {
     const signed = await signer.sign(request);
 
-    const response = await fetch(url.toString(), {
-      method: 'POST',
-      headers: signed.headers as Record<string, string>,
-      body,
-    });
+    log('DEBUG', `-> POST ${config.url.pathname}`);
+
+    const response = await fetchWithRetry(
+      config.url.toString(),
+      {
+        method: 'POST',
+        headers: signed.headers as Record<string, string>,
+        body,
+      },
+      config.timeoutMs,
+      config.retries,
+    );
 
     await handleResponse(response, requestId);
   } catch (err) {
-    process.stderr.write(`mcp-sigv4-proxy: request failed: ${err}\n`);
+    const isTimeout = err instanceof DOMException && err.name === 'AbortError';
+    const message = isTimeout ? 'Request timed out' : 'Proxy request failed';
+    log('ERROR', `request failed: ${err}`);
     process.stdout.write(
       JSON.stringify({
         jsonrpc: '2.0',
         id: requestId,
-        error: { code: -32000, message: 'Proxy request failed' },
+        error: { code: -32000, message },
       }) + '\n',
     );
   }
 }
+
+// --- Main entry ---
 
 export function startProxy(): void {
   const config = validateEnv();
@@ -202,22 +351,22 @@ export function startProxy(): void {
   let pending: Promise<void> = Promise.resolve();
 
   rl.on('line', (line) => {
-    pending = pending.then(() => processLine(line, config.url, signer)).catch(() => {});
+    pending = pending.then(() => processLine(line, config, signer)).catch(() => {});
   });
 
   rl.on('close', async () => {
-    process.stderr.write('mcp-sigv4-proxy: stdin closed, draining in-flight requests\n');
+    log('INFO', 'stdin closed, draining in-flight requests');
     await pending;
     process.exit(0);
   });
 
   process.on('SIGTERM', () => {
-    process.stderr.write('mcp-sigv4-proxy: received SIGTERM, shutting down\n');
+    log('INFO', 'received SIGTERM, shutting down');
     rl.close();
   });
 
   process.on('SIGINT', () => {
-    process.stderr.write('mcp-sigv4-proxy: received SIGINT, shutting down\n');
+    log('INFO', 'received SIGINT, shutting down');
     rl.close();
   });
 }

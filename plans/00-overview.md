@@ -32,6 +32,7 @@ Publish a standalone CLI package that acts as a stdio MCP proxy, signing each re
 | [04-ci-release.md](04-ci-release.md) | GitHub Actions, dependabot, npm publishing |
 | [05-documentation.md](05-documentation.md) | README, CONTRIBUTING, LICENSE |
 | [06-rollout.md](06-rollout.md) | npm setup, branch protection, consumer migration |
+| [07-improvements.md](07-improvements.md) | Future improvements from aws/mcp-proxy-for-aws analysis |
 | [CHECKLIST.md](CHECKLIST.md) | Implementation checklist with all tasks |
 
 ## Repository Structure

@@ -1,6 +1,6 @@
 {
   "name": "@deotio/mcp-sigv4-proxy",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "stdio MCP proxy with AWS SigV4 signing — connect Claude Code to any IAM-authenticated MCP server using a named AWS profile",
   "type": "module",
   "bin": {

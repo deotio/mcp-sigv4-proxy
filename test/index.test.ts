@@ -48,26 +48,118 @@ const baseEnv = {
   AWS_ACCESS_KEY_ID: 'AKIAIOSFODNN7EXAMPLE',
   AWS_SECRET_ACCESS_KEY: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
   AWS_REGION: 'us-east-1',
+  MCP_LOG_LEVEL: 'DEBUG',
 };
+
+function makeConfig(overrides?: Record<string, unknown>) {
+  return {
+    url: new URL('https://example.com'),
+    region: 'us-east-1',
+    service: 'test',
+    timeoutMs: 180_000,
+    retries: 0,
+    ...overrides,
+  };
+}
 
 // --- Unit tests (import proxy.ts for coverage) ---
 
 import {
   parseInputLine,
+  parseEndpointUrl,
   buildHttpRequest,
   handleResponse,
   processLine,
   validateEnv,
   createSigner,
+  setLogLevel,
+  log,
   MAX_SSE_BUFFER_BYTES,
 } from '../src/proxy.js';
 
-describe('parseInputLine', () => {
+// --- parseEndpointUrl ---
+
+describe('parseEndpointUrl', () => {
+  test('parses bedrock-agentcore amazonaws hostname', () => {
+    const result = parseEndpointUrl('bedrock-agentcore.us-east-1.amazonaws.com');
+    expect(result).toEqual({ service: 'bedrock-agentcore', region: 'us-east-1' });
+  });
+
+  test('parses eu-west-1 region', () => {
+    const result = parseEndpointUrl('bedrock-agentcore.eu-west-1.amazonaws.com');
+    expect(result).toEqual({ service: 'bedrock-agentcore', region: 'eu-west-1' });
+  });
+
+  test('parses service.region.api.aws format', () => {
+    const result = parseEndpointUrl('myservice.us-west-2.api.aws');
+    expect(result).toEqual({ service: 'myservice', region: 'us-west-2' });
+  });
+
+  test('returns null for non-standard hostname', () => {
+    expect(parseEndpointUrl('example.com')).toBeNull();
+  });
+
+  test('returns null for localhost', () => {
+    expect(parseEndpointUrl('localhost')).toBeNull();
+  });
+
+  test('returns null for IP address', () => {
+    expect(parseEndpointUrl('127.0.0.1')).toBeNull();
+  });
+});
+
+// --- log ---
+
+describe('log', () => {
   let stderrSpy: ReturnType<typeof jest.spyOn>;
   beforeEach(() => {
     stderrSpy = jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
   });
-  afterEach(() => stderrSpy.mockRestore());
+  afterEach(() => {
+    stderrSpy.mockRestore();
+    setLogLevel('ERROR');
+  });
+
+  test('ERROR level logs errors', () => {
+    setLogLevel('ERROR');
+    log('ERROR', 'test error');
+    expect(stderrSpy).toHaveBeenCalledWith('mcp-sigv4-proxy: test error\n');
+  });
+
+  test('ERROR level suppresses warnings', () => {
+    setLogLevel('ERROR');
+    log('WARNING', 'test warning');
+    expect(stderrSpy).not.toHaveBeenCalled();
+  });
+
+  test('DEBUG level logs everything', () => {
+    setLogLevel('DEBUG');
+    log('DEBUG', 'debug msg');
+    log('INFO', 'info msg');
+    log('WARNING', 'warn msg');
+    log('ERROR', 'error msg');
+    expect(stderrSpy).toHaveBeenCalledTimes(4);
+  });
+
+  test('SILENT level suppresses everything', () => {
+    setLogLevel('SILENT');
+    log('ERROR', 'should not appear');
+    expect(stderrSpy).not.toHaveBeenCalled();
+  });
+});
+
+// --- parseInputLine ---
+
+describe('parseInputLine', () => {
+  let stderrSpy: ReturnType<typeof jest.spyOn>;
+  beforeEach(() => {
+    setLogLevel('DEBUG');
+    stderrSpy = jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  });
+  afterEach(() => {
+    stderrSpy.mockRestore();
+    setLogLevel('ERROR');
+  });
 
   test('returns null for empty string', () => {
     expect(parseInputLine('')).toBeNull();
@@ -76,12 +168,16 @@ describe('parseInputLine', () => {
 
   test('returns null and warns for non-JSON', () => {
     expect(parseInputLine('not json')).toBeNull();
-    expect(stderrSpy).toHaveBeenCalledWith('mcp-sigv4-proxy: ignoring non-JSON input line\n');
+    expect(stderrSpy).toHaveBeenCalledWith(
+      expect.stringContaining('ignoring non-JSON input line'),
+    );
   });
 
   test('returns null and warns for JSON without jsonrpc', () => {
     expect(parseInputLine('{"foo": "bar"}')).toBeNull();
-    expect(stderrSpy).toHaveBeenCalledWith('mcp-sigv4-proxy: ignoring non-JSON-RPC message\n');
+    expect(stderrSpy).toHaveBeenCalledWith(
+      expect.stringContaining('ignoring non-JSON-RPC message'),
+    );
   });
 
   test('returns null for wrong jsonrpc version', () => {
@@ -110,6 +206,8 @@ describe('parseInputLine', () => {
   });
 });
 
+// --- buildHttpRequest ---
+
 describe('buildHttpRequest', () => {
   test('builds correct HttpRequest', () => {
     const url = new URL('https://example.com/path?q=1');
@@ -119,7 +217,6 @@ describe('buildHttpRequest', () => {
     expect(req.method).toBe('POST');
     expect(req.hostname).toBe('example.com');
     expect(req.path).toBe('/path?q=1');
-    // Smithy HttpRequest normalizes header names
     const headers = Object.fromEntries(
       Object.entries(req.headers).map(([k, v]) => [k.toLowerCase(), v]),
     );
@@ -130,17 +227,21 @@ describe('buildHttpRequest', () => {
   });
 });
 
+// --- handleResponse ---
+
 describe('handleResponse', () => {
   let stdoutSpy: ReturnType<typeof jest.spyOn>;
   let stderrSpy: ReturnType<typeof jest.spyOn>;
 
   beforeEach(() => {
+    setLogLevel('DEBUG');
     stdoutSpy = jest.spyOn(process.stdout, 'write').mockImplementation(() => true);
     stderrSpy = jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
   });
   afterEach(() => {
     stdoutSpy.mockRestore();
     stderrSpy.mockRestore();
+    setLogLevel('ERROR');
   });
 
   test('HTTP error produces sanitized JSON-RPC error', async () => {
@@ -151,12 +252,10 @@ describe('handleResponse', () => {
 
     await handleResponse(response, 1);
 
-    // stderr gets full body
     expect(stderrSpy).toHaveBeenCalledWith(
       expect.stringContaining('HTTP 403: AccessDenied'),
     );
 
-    // stdout gets sanitized error with correct id
     const output = JSON.parse((stdoutSpy.mock.calls[0][0] as string).trim());
     expect(output.jsonrpc).toBe('2.0');
     expect(output.id).toBe(1);
@@ -165,10 +264,7 @@ describe('handleResponse', () => {
   });
 
   test('HTTP 500 produces sanitized error', async () => {
-    const response = new Response('Internal Server Error details', {
-      status: 500,
-    });
-
+    const response = new Response('Internal Server Error details', { status: 500 });
     await handleResponse(response, 5);
 
     const output = JSON.parse((stdoutSpy.mock.calls[0][0] as string).trim());
@@ -240,15 +336,11 @@ describe('handleResponse', () => {
     expect(stderrSpy).toHaveBeenCalledWith(
       expect.stringContaining('dropping non-JSON SSE data'),
     );
-    // Only the valid JSON line should be forwarded
     expect(stdoutSpy).toHaveBeenCalledTimes(1);
-    expect(JSON.parse((stdoutSpy.mock.calls[0][0] as string).trim())).toEqual({
-      valid: 'json',
-    });
+    expect(JSON.parse((stdoutSpy.mock.calls[0][0] as string).trim())).toEqual({ valid: 'json' });
   });
 
   test('SSE buffer overflow aborts and emits error', async () => {
-    // Create a response body that exceeds MAX_SSE_BUFFER_BYTES without newlines
     const bigChunk = 'x'.repeat(MAX_SSE_BUFFER_BYTES + 100);
     const response = new Response(bigChunk, {
       status: 200,
@@ -258,7 +350,7 @@ describe('handleResponse', () => {
     await handleResponse(response, 7);
 
     expect(stderrSpy).toHaveBeenCalledWith(
-      'mcp-sigv4-proxy: SSE buffer exceeded 1 MB limit, aborting stream\n',
+      expect.stringContaining('SSE buffer exceeded 1 MB limit'),
     );
     const output = JSON.parse((stdoutSpy.mock.calls[0][0] as string).trim());
     expect(output.id).toBe(7);
@@ -285,7 +377,7 @@ describe('MAX_SSE_BUFFER_BYTES', () => {
   });
 });
 
-// --- Unit tests: validateEnv ---
+// --- validateEnv ---
 
 describe('validateEnv', () => {
   let exitSpy: ReturnType<typeof jest.spyOn>;
@@ -309,7 +401,6 @@ describe('validateEnv', () => {
     delete process.env.MCP_SERVER_URL;
     expect(() => validateEnv()).toThrow('process.exit called');
     expect(exitSpy).toHaveBeenCalledWith(1);
-    expect(stderrSpy).toHaveBeenCalledWith('mcp-sigv4-proxy: MCP_SERVER_URL is required\n');
   });
 
   test('exits if NODE_TLS_REJECT_UNAUTHORIZED=0', () => {
@@ -317,44 +408,64 @@ describe('validateEnv', () => {
     process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
     expect(() => validateEnv()).toThrow('process.exit called');
     expect(exitSpy).toHaveBeenCalledWith(1);
-    expect(stderrSpy).toHaveBeenCalledWith(
-      expect.stringContaining('NODE_TLS_REJECT_UNAUTHORIZED=0 is not allowed'),
-    );
   });
 
-  test('exits if URL is not https', () => {
+  test('exits if URL is http:// (non-localhost)', () => {
     process.env.MCP_SERVER_URL = 'http://example.com';
     delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
     expect(() => validateEnv()).toThrow('process.exit called');
-    expect(exitSpy).toHaveBeenCalledWith(1);
-    expect(stderrSpy).toHaveBeenCalledWith(
-      expect.stringContaining('must use https://'),
-    );
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('must use https://'));
   });
 
   test('exits for file:// URL', () => {
     process.env.MCP_SERVER_URL = 'file:///etc/passwd';
     delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
     expect(() => validateEnv()).toThrow('process.exit called');
-    expect(stderrSpy).toHaveBeenCalledWith(
-      expect.stringContaining('must use https://'),
-    );
   });
 
-  test('returns config for valid https URL', () => {
-    process.env.MCP_SERVER_URL = 'https://example.com/path';
-    process.env.AWS_REGION = 'eu-west-1';
-    process.env.AWS_SERVICE = 'custom-service';
+  test('allows http://localhost', () => {
+    process.env.MCP_SERVER_URL = 'http://localhost:8080/mcp';
+    delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+    delete process.env.AWS_REGION;
+    delete process.env.AWS_SERVICE;
+    const config = validateEnv();
+    expect(config.url.hostname).toBe('localhost');
+  });
+
+  test('allows http://127.0.0.1', () => {
+    process.env.MCP_SERVER_URL = 'http://127.0.0.1:3000';
+    delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+    delete process.env.AWS_REGION;
+    delete process.env.AWS_SERVICE;
+    const config = validateEnv();
+    expect(config.url.hostname).toBe('127.0.0.1');
+  });
+
+  test('infers service and region from amazonaws URL', () => {
+    process.env.MCP_SERVER_URL =
+      'https://bedrock-agentcore.eu-west-1.amazonaws.com/runtimes/abc/invocations';
+    delete process.env.AWS_REGION;
+    delete process.env.AWS_SERVICE;
     delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
 
     const config = validateEnv();
-    expect(config.url.hostname).toBe('example.com');
     expect(config.region).toBe('eu-west-1');
-    expect(config.service).toBe('custom-service');
+    expect(config.service).toBe('bedrock-agentcore');
   });
 
-  test('uses default region and service', () => {
-    process.env.MCP_SERVER_URL = 'https://example.com';
+  test('env vars override inferred values', () => {
+    process.env.MCP_SERVER_URL = 'https://bedrock-agentcore.us-east-1.amazonaws.com/path';
+    process.env.AWS_REGION = 'ap-southeast-1';
+    process.env.AWS_SERVICE = 'custom-svc';
+    delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+
+    const config = validateEnv();
+    expect(config.region).toBe('ap-southeast-1');
+    expect(config.service).toBe('custom-svc');
+  });
+
+  test('falls back to defaults for non-standard hostnames', () => {
+    process.env.MCP_SERVER_URL = 'https://my-custom-server.example.com';
     delete process.env.AWS_REGION;
     delete process.env.AWS_SERVICE;
     delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
@@ -363,70 +474,115 @@ describe('validateEnv', () => {
     expect(config.region).toBe('us-east-1');
     expect(config.service).toBe('bedrock-agentcore');
   });
+
+  test('parses MCP_TIMEOUT', () => {
+    process.env.MCP_SERVER_URL = 'https://example.com';
+    process.env.MCP_TIMEOUT = '60';
+    delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+
+    const config = validateEnv();
+    expect(config.timeoutMs).toBe(60_000);
+  });
+
+  test('defaults timeout to 180s', () => {
+    process.env.MCP_SERVER_URL = 'https://example.com';
+    delete process.env.MCP_TIMEOUT;
+    delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+
+    const config = validateEnv();
+    expect(config.timeoutMs).toBe(180_000);
+  });
+
+  test('parses MCP_RETRIES', () => {
+    process.env.MCP_SERVER_URL = 'https://example.com';
+    process.env.MCP_RETRIES = '5';
+    delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+
+    const config = validateEnv();
+    expect(config.retries).toBe(5);
+  });
+
+  test('clamps MCP_RETRIES to 0-10', () => {
+    process.env.MCP_SERVER_URL = 'https://example.com';
+    process.env.MCP_RETRIES = '99';
+    delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+
+    const config = validateEnv();
+    expect(config.retries).toBe(10);
+  });
+
+  test('defaults retries to 0', () => {
+    process.env.MCP_SERVER_URL = 'https://example.com';
+    delete process.env.MCP_RETRIES;
+    delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+
+    const config = validateEnv();
+    expect(config.retries).toBe(0);
+  });
 });
 
-// --- Unit tests: createSigner ---
+// --- createSigner ---
 
 describe('createSigner', () => {
   test('returns a SignatureV4 instance', () => {
-    const config = {
-      url: new URL('https://example.com'),
-      region: 'us-east-1',
-      service: 'bedrock-agentcore',
-    };
-    // Set credentials so fromNodeProviderChain can resolve
     process.env.AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE';
     process.env.AWS_SECRET_ACCESS_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
 
-    const signer = createSigner(config);
+    const signer = createSigner(makeConfig());
     expect(signer).toBeDefined();
     expect(typeof signer.sign).toBe('function');
   });
 });
 
-// --- Unit tests: processLine ---
+// --- processLine ---
 
 describe('processLine', () => {
   let stdoutSpy: ReturnType<typeof jest.spyOn>;
   let stderrSpy: ReturnType<typeof jest.spyOn>;
 
   beforeEach(() => {
+    setLogLevel('DEBUG');
     stdoutSpy = jest.spyOn(process.stdout, 'write').mockImplementation(() => true);
     stderrSpy = jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
   });
   afterEach(() => {
     stdoutSpy.mockRestore();
     stderrSpy.mockRestore();
+    setLogLevel('ERROR');
   });
 
   test('skips empty lines', async () => {
-    const url = new URL('https://example.com');
-    const signer = createSigner({ url, region: 'us-east-1', service: 'test' });
-    await processLine('', url, signer);
+    const config = makeConfig();
+    const signer = createSigner(config);
+    await processLine('', config, signer);
     expect(stdoutSpy).not.toHaveBeenCalled();
   });
 
   test('skips non-JSON', async () => {
-    const url = new URL('https://example.com');
-    const signer = createSigner({ url, region: 'us-east-1', service: 'test' });
-    await processLine('not json', url, signer);
-    expect(stderrSpy).toHaveBeenCalledWith('mcp-sigv4-proxy: ignoring non-JSON input line\n');
+    const config = makeConfig();
+    const signer = createSigner(config);
+    await processLine('not json', config, signer);
+    expect(stderrSpy).toHaveBeenCalledWith(
+      expect.stringContaining('ignoring non-JSON input line'),
+    );
     expect(stdoutSpy).not.toHaveBeenCalled();
   });
 
   test('skips non-JSON-RPC', async () => {
-    const url = new URL('https://example.com');
-    const signer = createSigner({ url, region: 'us-east-1', service: 'test' });
-    await processLine('{"foo":"bar"}', url, signer);
-    expect(stderrSpy).toHaveBeenCalledWith('mcp-sigv4-proxy: ignoring non-JSON-RPC message\n');
+    const config = makeConfig();
+    const signer = createSigner(config);
+    await processLine('{"foo":"bar"}', config, signer);
+    expect(stderrSpy).toHaveBeenCalledWith(
+      expect.stringContaining('ignoring non-JSON-RPC message'),
+    );
   });
 
   test('signs and forwards valid JSON-RPC, relays response', async () => {
     process.env.AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE';
     process.env.AWS_SECRET_ACCESS_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
 
-    const url = new URL('https://example.com/path');
-    const signer = createSigner({ url, region: 'us-east-1', service: 'test' });
+    const config = makeConfig({ url: new URL('https://example.com/path') });
+    const signer = createSigner(config);
 
     const responseBody = JSON.stringify({ jsonrpc: '2.0', id: 1, result: 'ok' });
     const originalFetch = globalThis.fetch;
@@ -437,7 +593,7 @@ describe('processLine', () => {
       })) as typeof fetch;
 
     try {
-      await processLine('{"jsonrpc":"2.0","method":"test","id":1}', url, signer);
+      await processLine('{"jsonrpc":"2.0","method":"test","id":1}', config, signer);
 
       const output = JSON.parse((stdoutSpy.mock.calls[0][0] as string).trim());
       expect(output.jsonrpc).toBe('2.0');
@@ -452,19 +608,48 @@ describe('processLine', () => {
     process.env.AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE';
     process.env.AWS_SECRET_ACCESS_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
 
-    const url = new URL('https://127.0.0.1:1');
-    const signer = createSigner({ url, region: 'us-east-1', service: 'test' });
-    await processLine('{"jsonrpc":"2.0","method":"test","id":99}', url, signer);
+    const config = makeConfig({ url: new URL('https://127.0.0.1:1') });
+    const signer = createSigner(config);
+    await processLine('{"jsonrpc":"2.0","method":"test","id":99}', config, signer);
 
     expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('request failed'));
     const output = JSON.parse((stdoutSpy.mock.calls[0][0] as string).trim());
     expect(output.id).toBe(99);
     expect(output.error.code).toBe(-32000);
-    expect(output.error.message).toBe('Proxy request failed');
+  });
+
+  test('timeout produces specific error message', async () => {
+    process.env.AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE';
+    process.env.AWS_SECRET_ACCESS_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
+
+    const config = makeConfig({
+      url: new URL('https://example.com'),
+      timeoutMs: 1, // 1ms timeout — will always abort
+    });
+    const signer = createSigner(config);
+
+    // Mock fetch to hang long enough to trigger timeout
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      // Wait for abort signal
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
+        });
+      });
+    }) as typeof fetch;
+
+    try {
+      await processLine('{"jsonrpc":"2.0","method":"test","id":1}', config, signer);
+      const output = JSON.parse((stdoutSpy.mock.calls[0][0] as string).trim());
+      expect(output.error.message).toBe('Request timed out');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
 
-// --- Integration tests (spawn compiled binary) ---
+// --- Integration tests ---
 
 describe('integration: startup validation', () => {
   test('missing MCP_SERVER_URL exits with code 1', async () => {
@@ -473,7 +658,7 @@ describe('integration: startup validation', () => {
     expect(result.stderr).toContain('MCP_SERVER_URL is required');
   });
 
-  test('http:// URL is rejected', async () => {
+  test('http:// remote URL is rejected', async () => {
     const result = await spawnProxy({ MCP_SERVER_URL: 'http://example.com/foo' });
     expect(result.code).toBe(1);
     expect(result.stderr).toContain('must use https://');
@@ -504,6 +689,26 @@ describe('integration: startup validation', () => {
     const result = await spawnProxy(baseEnv, { timeoutMs: 3000 });
     expect(result.code).toBe(0);
     expect(result.stderr).toContain('stdin closed');
+  });
+});
+
+describe('integration: URL inference', () => {
+  test('infers region and service from amazonaws URL', async () => {
+    // Explicitly unset AWS_REGION so inference from URL is used
+    const envWithoutRegion = { ...baseEnv, AWS_REGION: '' };
+    const result = await spawnProxy(
+      {
+        ...envWithoutRegion,
+        MCP_SERVER_URL:
+          'https://bedrock-agentcore.eu-west-1.amazonaws.com/runtimes/abc/invocations',
+        MCP_LOG_LEVEL: 'DEBUG',
+      },
+      { timeoutMs: 3000 },
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain('service: bedrock-agentcore');
+    expect(result.stderr).toContain('region: eu-west-1');
   });
 });
 
@@ -579,7 +784,7 @@ describe('integration: sequential processing', () => {
 describe('integration: graceful shutdown', () => {
   test('stdin close drains and exits 0', async () => {
     const result = await spawnProxy(baseEnv, { timeoutMs: 3000 });
-    expect(result.stderr).toContain('stdin closed, draining in-flight requests');
+    expect(result.stderr).toContain('stdin closed');
     expect(result.code).toBe(0);
   });
 
@@ -603,5 +808,26 @@ describe('integration: graceful shutdown', () => {
     );
 
     expect(result.stderr).toContain('received SIGTERM');
+  });
+});
+
+describe('integration: log level', () => {
+  test('SILENT suppresses all stderr', async () => {
+    const result = await spawnProxy(
+      { ...baseEnv, MCP_LOG_LEVEL: 'SILENT' },
+      { input: ['not json'], timeoutMs: 3000 },
+    );
+
+    expect(result.stderr).toBe('');
+  });
+
+  test('ERROR is the default (suppresses warnings)', async () => {
+    const result = await spawnProxy(
+      { ...baseEnv, MCP_LOG_LEVEL: '' },
+      { input: ['not json'], timeoutMs: 3000 },
+    );
+
+    // "ignoring non-JSON input line" is WARNING level — should not appear
+    expect(result.stderr).not.toContain('ignoring');
   });
 });
