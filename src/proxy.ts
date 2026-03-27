@@ -159,10 +159,16 @@ export function parseInputLine(line: string): { body: string; requestId: unknown
 // --- Request building ---
 
 export function buildHttpRequest(url: URL, body: string): HttpRequest {
+  const query: Record<string, string> = {};
+  url.searchParams.forEach((value, key) => {
+    query[key] = value;
+  });
+
   return new HttpRequest({
     method: 'POST',
     hostname: url.hostname,
-    path: url.pathname + url.search,
+    path: url.pathname,
+    ...(Object.keys(query).length > 0 && { query }),
     headers: {
       'Content-Type': 'application/json',
       'Content-Length': String(Buffer.byteLength(body)),

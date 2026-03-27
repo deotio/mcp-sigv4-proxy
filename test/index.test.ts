@@ -209,14 +209,15 @@ describe('parseInputLine', () => {
 // --- buildHttpRequest ---
 
 describe('buildHttpRequest', () => {
-  test('builds correct HttpRequest', () => {
+  test('builds correct HttpRequest with query separated from path', () => {
     const url = new URL('https://example.com/path?q=1');
     const body = '{"jsonrpc":"2.0","method":"test","id":1}';
     const req = buildHttpRequest(url, body);
 
     expect(req.method).toBe('POST');
     expect(req.hostname).toBe('example.com');
-    expect(req.path).toBe('/path?q=1');
+    expect(req.path).toBe('/path');
+    expect(req.query).toEqual({ q: '1' });
     const headers = Object.fromEntries(
       Object.entries(req.headers).map(([k, v]) => [k.toLowerCase(), v]),
     );
@@ -224,6 +225,26 @@ describe('buildHttpRequest', () => {
     expect(headers['host']).toBe('example.com');
     expect(headers['content-length']).toBe(String(Buffer.byteLength(body)));
     expect(req.body).toBe(body);
+  });
+
+  test('omits query when URL has no query string', () => {
+    const url = new URL('https://example.com/path');
+    const req = buildHttpRequest(url, '{}');
+
+    expect(req.path).toBe('/path');
+    expect(Object.keys(req.query ?? {}).length).toBe(0);
+  });
+
+  test('handles AgentCore URL with encoded ARN', () => {
+    const url = new URL(
+      'https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/arn%3Aaws%3Abedrock-agentcore%3Aus-east-1%3A130128480380%3Aruntime%2FfinopsMcpprod-ZW2BlvHbUv/invocations?qualifier=DEFAULT',
+    );
+    const req = buildHttpRequest(url, '{}');
+
+    expect(req.path).toBe(
+      '/runtimes/arn%3Aaws%3Abedrock-agentcore%3Aus-east-1%3A130128480380%3Aruntime%2FfinopsMcpprod-ZW2BlvHbUv/invocations',
+    );
+    expect(req.query).toEqual({ qualifier: 'DEFAULT' });
   });
 });
 
