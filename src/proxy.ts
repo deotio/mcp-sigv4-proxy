@@ -6,8 +6,9 @@ import readline from 'readline';
 
 export const MAX_SSE_BUFFER_BYTES = 1_048_576; // 1 MB
 const DEFAULT_TIMEOUT_MS = 180_000; // 180s, matches AWS proxy
-const DEFAULT_RETRIES = 0;
+const DEFAULT_RETRIES = 2;
 const RETRY_BASE_MS = 1000;
+const COLD_START_RETRY_MS = 5000;
 
 // --- Log levels ---
 
@@ -205,10 +206,14 @@ async function fetchWithRetry(
     try {
       const response = await fetchWithTimeout(url, init, timeoutMs);
 
-      // Only retry on 5xx server errors
-      if (response.status >= 500 && attempt < retries) {
-        log('WARNING', `HTTP ${response.status}, retrying (${attempt + 1}/${retries})`);
-        await sleep(RETRY_BASE_MS * Math.pow(2, attempt));
+      // Retry on 5xx server errors and 424 (AgentCore cold-start timeout)
+      const retryable = response.status >= 500 || response.status === 424;
+      if (retryable && attempt < retries) {
+        const delay = response.status === 424
+          ? COLD_START_RETRY_MS * Math.pow(2, attempt)
+          : RETRY_BASE_MS * Math.pow(2, attempt);
+        log('WARNING', `HTTP ${response.status}, retrying in ${delay}ms (${attempt + 1}/${retries})`);
+        await sleep(delay);
         continue;
       }
 
@@ -239,11 +244,22 @@ export async function handleResponse(response: Response, requestId: unknown): Pr
   if (!response.ok) {
     const text = await response.text();
     log('ERROR', `HTTP ${response.status}: ${text}`);
+
+    // Extract the upstream message for the JSON-RPC error (if JSON, use .message; otherwise trim)
+    let detail = '';
+    try {
+      const parsed = JSON.parse(text);
+      if (typeof parsed.message === 'string') detail = `: ${parsed.message}`;
+    } catch {
+      const trimmed = text.trim();
+      if (trimmed.length > 0 && trimmed.length <= 200) detail = `: ${trimmed}`;
+    }
+
     process.stdout.write(
       JSON.stringify({
         jsonrpc: '2.0',
         id: requestId,
-        error: { code: -32000, message: `HTTP ${response.status}` },
+        error: { code: -32000, message: `HTTP ${response.status}${detail}` },
       }) + '\n',
     );
     return;

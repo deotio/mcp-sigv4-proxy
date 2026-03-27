@@ -57,7 +57,7 @@ function makeConfig(overrides?: Record<string, unknown>) {
     region: 'us-east-1',
     service: 'test',
     timeoutMs: 180_000,
-    retries: 0,
+    retries: 2,
     ...overrides,
   };
 }
@@ -265,31 +265,40 @@ describe('handleResponse', () => {
     setLogLevel('ERROR');
   });
 
-  test('HTTP error produces sanitized JSON-RPC error', async () => {
-    const response = new Response('AccessDenied: you are not authorized', {
+  test('HTTP error includes upstream message from JSON body', async () => {
+    const response = new Response('{"message":"User is not authorized"}', {
       status: 403,
       statusText: 'Forbidden',
+      headers: { 'Content-Type': 'application/json' },
     });
 
     await handleResponse(response, 1);
 
     expect(stderrSpy).toHaveBeenCalledWith(
-      expect.stringContaining('HTTP 403: AccessDenied'),
+      expect.stringContaining('HTTP 403'),
     );
 
     const output = JSON.parse((stdoutSpy.mock.calls[0][0] as string).trim());
     expect(output.jsonrpc).toBe('2.0');
     expect(output.id).toBe(1);
     expect(output.error.code).toBe(-32000);
-    expect(output.error.message).toBe('HTTP 403');
+    expect(output.error.message).toBe('HTTP 403: User is not authorized');
   });
 
-  test('HTTP 500 produces sanitized error', async () => {
+  test('HTTP error includes short plain-text body', async () => {
     const response = new Response('Internal Server Error details', { status: 500 });
     await handleResponse(response, 5);
 
     const output = JSON.parse((stdoutSpy.mock.calls[0][0] as string).trim());
     expect(output.id).toBe(5);
+    expect(output.error.message).toBe('HTTP 500: Internal Server Error details');
+  });
+
+  test('HTTP error omits overly long plain-text body', async () => {
+    const response = new Response('x'.repeat(300), { status: 500 });
+    await handleResponse(response, 6);
+
+    const output = JSON.parse((stdoutSpy.mock.calls[0][0] as string).trim());
     expect(output.error.message).toBe('HTTP 500');
   });
 
@@ -532,13 +541,13 @@ describe('validateEnv', () => {
     expect(config.retries).toBe(10);
   });
 
-  test('defaults retries to 0', () => {
+  test('defaults retries to 2', () => {
     process.env.MCP_SERVER_URL = 'https://example.com';
     delete process.env.MCP_RETRIES;
     delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
 
     const config = validateEnv();
-    expect(config.retries).toBe(0);
+    expect(config.retries).toBe(2);
   });
 });
 
@@ -629,7 +638,7 @@ describe('processLine', () => {
     process.env.AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE';
     process.env.AWS_SECRET_ACCESS_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
 
-    const config = makeConfig({ url: new URL('https://127.0.0.1:1') });
+    const config = makeConfig({ url: new URL('https://127.0.0.1:1'), retries: 0 });
     const signer = createSigner(config);
     await processLine('{"jsonrpc":"2.0","method":"test","id":99}', config, signer);
 
@@ -755,7 +764,7 @@ describe('integration: input validation', () => {
 describe('integration: request forwarding', () => {
   test('network error produces JSON-RPC error with correct id', async () => {
     const result = await spawnProxy(
-      { ...baseEnv, MCP_SERVER_URL: 'https://127.0.0.1:1' },
+      { ...baseEnv, MCP_SERVER_URL: 'https://127.0.0.1:1', MCP_RETRIES: '0' },
       { input: ['{"jsonrpc":"2.0","method":"test","id":42}'], timeoutMs: 5000 },
     );
 
@@ -766,7 +775,7 @@ describe('integration: request forwarding', () => {
 
   test('notification error has id: null', async () => {
     const result = await spawnProxy(
-      { ...baseEnv, MCP_SERVER_URL: 'https://127.0.0.1:1' },
+      { ...baseEnv, MCP_SERVER_URL: 'https://127.0.0.1:1', MCP_RETRIES: '0' },
       {
         input: ['{"jsonrpc":"2.0","method":"notifications/initialized"}'],
         timeoutMs: 5000,
@@ -785,7 +794,7 @@ describe('integration: sequential processing', () => {
     );
 
     const result = await spawnProxy(
-      { ...baseEnv, MCP_SERVER_URL: 'https://127.0.0.1:1' },
+      { ...baseEnv, MCP_SERVER_URL: 'https://127.0.0.1:1', MCP_RETRIES: '0' },
       { input: lines, timeoutMs: 15000 },
     );
 
