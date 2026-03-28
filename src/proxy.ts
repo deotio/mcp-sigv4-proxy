@@ -657,14 +657,12 @@ export async function handleWarmLine(
   }
 
   if (WARM_CACHEABLE.has(method)) {
-    // List methods: serve from cache immediately if available…
+    // List methods: serve from cache immediately if available — never block on ws.ready.
+    // Warm-up is an optimistic pre-fetch; if it hasn't completed yet, fall through and
+    // let the backend answer directly. Blocking here would cause Claude Code's 60s
+    // tool-discovery timeout to fire before warm-up finishes.
     if (tryWarmResponse(input.body, input.requestId, ws)) return true;
-    // …otherwise wait for warm-up to complete, then try cache again before forwarding
-    log('INFO', `warm: cache miss for ${method}, waiting for warm-up to complete`);
-    const warmed = await ws.ready;
-    log('INFO', `warm: warm-up ${warmed ? 'succeeded' : 'failed'} — ${method} ${warmed ? 'served from cache' : 'forwarding to backend'}`);
-    if (tryWarmResponse(input.body, input.requestId, ws)) return true;
-    log('INFO', `warm: cache still empty for ${method}, forwarding to backend`);
+    log('INFO', `warm: cache miss for ${method}, forwarding to backend`);
   }
   // Non-cacheable methods (tools/call etc): return false to forward normally.
   // fetchWithRetry handles any residual 424s if the backend isn't warm yet.
