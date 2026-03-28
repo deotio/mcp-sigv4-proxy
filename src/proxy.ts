@@ -10,6 +10,11 @@ const DEFAULT_RETRIES = 2;
 const RETRY_BASE_MS = 1000;
 const COLD_START_RETRY_MS = 5000;
 
+// Warm mode defaults
+const DEFAULT_WARM_RETRIES = 5;
+const DEFAULT_WARM_RETRY_DELAY_MS = 10_000;
+const DEFAULT_WARM_TIMEOUT_MS = 300_000; // 5 min
+
 // --- Log levels ---
 
 export type LogLevel = 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR' | 'SILENT';
@@ -62,6 +67,10 @@ export interface ProxyConfig {
   service: string;
   timeoutMs: number;
   retries: number;
+  warm: boolean;
+  warmRetries: number;
+  warmRetryDelayMs: number;
+  warmTimeoutMs: number;
 }
 
 export function validateEnv(): ProxyConfig {
@@ -112,13 +121,28 @@ export function validateEnv(): ProxyConfig {
     ? Math.min(Math.max(0, Math.floor(Number(process.env.MCP_RETRIES))), 10)
     : DEFAULT_RETRIES;
 
+  // Parse warm mode
+  const warm = process.env.MCP_WARM === '1';
+  const warmRetries = process.env.MCP_WARM_RETRIES
+    ? Math.min(Math.max(0, Math.floor(Number(process.env.MCP_WARM_RETRIES))), 20)
+    : DEFAULT_WARM_RETRIES;
+  const warmRetryDelayMs = process.env.MCP_WARM_RETRY_DELAY
+    ? Math.max(1000, Number(process.env.MCP_WARM_RETRY_DELAY))
+    : DEFAULT_WARM_RETRY_DELAY_MS;
+  const warmTimeoutMs = process.env.MCP_WARM_TIMEOUT
+    ? Number(process.env.MCP_WARM_TIMEOUT)
+    : DEFAULT_WARM_TIMEOUT_MS;
+
   log('INFO', `target: ${url.hostname}, service: ${service}, region: ${region}`);
   if (inferred) {
     log('DEBUG', `inferred service=${inferred.service}, region=${inferred.region} from URL`);
   }
   log('DEBUG', `timeout: ${timeoutMs}ms, retries: ${retries}`);
+  if (warm) {
+    log('INFO', `warm mode enabled (retries: ${warmRetries}, delay: ${warmRetryDelayMs}ms, timeout: ${warmTimeoutMs}ms)`);
+  }
 
-  return { url, region, service, timeoutMs, retries };
+  return { url, region, service, timeoutMs, retries, warm, warmRetries, warmRetryDelayMs, warmTimeoutMs };
 }
 
 export function createSigner(config: ProxyConfig): SignatureV4 {
@@ -363,6 +387,189 @@ export async function processLine(
   }
 }
 
+// --- Warm mode ---
+
+type WarmMethod = 'initialize' | 'tools/list' | 'resources/list' | 'prompts/list';
+const WARM_CACHEABLE: ReadonlySet<string> = new Set<WarmMethod>([
+  'initialize', 'tools/list', 'resources/list', 'prompts/list',
+]);
+
+interface WarmState {
+  /** Resolves to true if warm mode is active, false if it fell back to pass-through */
+  ready: Promise<boolean>;
+  cache: Partial<Record<WarmMethod, unknown>>;
+  active: boolean;
+}
+
+/**
+ * Synthetic MCP initialize response returned when the backend hasn't responded yet.
+ * Advertises tools/resources/prompts capabilities so Claude Code proceeds to list calls.
+ */
+function syntheticInitializeResult(): unknown {
+  return {
+    protocolVersion: '2025-03-26',
+    capabilities: { tools: {}, resources: {}, prompts: {} },
+    serverInfo: { name: 'mcp-sigv4-proxy-warm', version: '0.4.0' },
+  };
+}
+
+export async function warmBackend(
+  config: ProxyConfig,
+  signer: SignatureV4,
+): Promise<WarmState> {
+  const state: WarmState = { ready: Promise.resolve(false), cache: {}, active: false };
+
+  state.ready = (async (): Promise<boolean> => {
+    const deadline = Date.now() + config.warmTimeoutMs;
+
+    // Step 1: Initialize the backend (retry through cold-start 424s)
+    const initBody = JSON.stringify({
+      jsonrpc: '2.0',
+      id: '__warmup_init__',
+      method: 'initialize',
+      params: {
+        protocolVersion: '2025-03-26',
+        capabilities: {},
+        clientInfo: { name: 'mcp-sigv4-proxy', version: '0.4.0' },
+      },
+    });
+
+    let initResponse: Response | null = null;
+    for (let attempt = 0; attempt <= config.warmRetries; attempt++) {
+      if (Date.now() >= deadline) break;
+      try {
+        const request = buildHttpRequest(config.url, initBody);
+        const signed = await signer.sign(request);
+        initResponse = await fetchWithTimeout(
+          config.url.toString(),
+          { method: 'POST', headers: signed.headers as Record<string, string>, body: initBody },
+          Math.min(config.timeoutMs, deadline - Date.now()),
+        );
+
+        if (initResponse.ok) break;
+
+        if (initResponse.status === 424 && attempt < config.warmRetries) {
+          const delay = config.warmRetryDelayMs * Math.pow(2, attempt);
+          log('INFO', `warm: cold-start (HTTP 424), retrying in ${delay}ms (${attempt + 1}/${config.warmRetries})`);
+          await sleep(Math.min(delay, deadline - Date.now()));
+          initResponse = null;
+          continue;
+        }
+
+        log('WARNING', `warm: initialize failed with HTTP ${initResponse.status}`);
+        return false;
+      } catch (err) {
+        if (attempt < config.warmRetries) {
+          const delay = config.warmRetryDelayMs * Math.pow(2, attempt);
+          log('WARNING', `warm: initialize error (${err}), retrying in ${delay}ms`);
+          await sleep(Math.min(delay, deadline - Date.now()));
+          continue;
+        }
+        log('ERROR', `warm: initialize failed after ${config.warmRetries} retries: ${err}`);
+        return false;
+      }
+    }
+
+    if (!initResponse?.ok) {
+      log('ERROR', 'warm: backend did not respond to initialize within timeout');
+      return false;
+    }
+
+    // Check for session ID — warm mode is incompatible with stateful servers
+    const sessionId = initResponse.headers.get('mcp-session-id');
+    if (sessionId) {
+      log('WARNING', 'warm: backend returned mcp-session-id header — stateful servers are not '
+        + 'compatible with warm mode. Falling back to pass-through mode.');
+      return false;
+    }
+
+    // Cache the initialize result (extract from JSON-RPC response wrapper)
+    try {
+      const body = await initResponse.text();
+      const parsed = JSON.parse(body);
+      if (parsed.result) {
+        state.cache.initialize = parsed.result;
+      } else {
+        state.cache.initialize = syntheticInitializeResult();
+      }
+    } catch {
+      state.cache.initialize = syntheticInitializeResult();
+    }
+
+    log('INFO', 'warm: backend initialized, prefetching capability lists');
+
+    // Step 2: Prefetch tools/list, resources/list, prompts/list
+    const listMethods: WarmMethod[] = ['tools/list', 'resources/list', 'prompts/list'];
+    await Promise.all(listMethods.map(async (method) => {
+      try {
+        const listBody = JSON.stringify({
+          jsonrpc: '2.0', id: `__warmup_${method}__`, method, params: {},
+        });
+        const request = buildHttpRequest(config.url, listBody);
+        const signed = await signer.sign(request);
+        const response = await fetchWithTimeout(
+          config.url.toString(),
+          { method: 'POST', headers: signed.headers as Record<string, string>, body: listBody },
+          Math.min(config.timeoutMs, Math.max(1000, deadline - Date.now())),
+        );
+        if (response.ok) {
+          const body = await response.text();
+          const parsed = JSON.parse(body);
+          if (parsed.result) {
+            state.cache[method] = parsed.result;
+            log('DEBUG', `warm: cached ${method} (${JSON.stringify(parsed.result).length} bytes)`);
+          }
+        }
+      } catch (err) {
+        log('WARNING', `warm: failed to prefetch ${method}: ${err}`);
+      }
+    }));
+
+    state.active = true;
+    const cached = Object.keys(state.cache).length;
+    log('INFO', `warm: ready (${cached} responses cached)`);
+    return true;
+  })();
+
+  return state;
+}
+
+/**
+ * Process a line in warm mode. Returns true if the message was handled locally
+ * (from cache or synthetic response), false if it should be forwarded to the backend.
+ */
+export function tryWarmResponse(
+  body: string,
+  requestId: unknown,
+  warmState: WarmState,
+): boolean {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return false;
+  }
+
+  const method = parsed.method as string | undefined;
+  if (!method || !WARM_CACHEABLE.has(method)) return false;
+
+  const cached = warmState.cache[method as WarmMethod];
+  if (!cached) return false;
+
+  // Respond from cache
+  const response = JSON.stringify({
+    jsonrpc: '2.0',
+    id: requestId,
+    result: cached,
+  });
+  process.stdout.write(response + '\n');
+  log('DEBUG', `warm: served ${method} from cache`);
+
+  // For initialize, also send the initialized notification to the backend (fire-and-forget).
+  // Claude Code sends this too, but in warm mode we intercepted initialize so we handle it.
+  return true;
+}
+
 // --- Main entry ---
 
 export function startProxy(): void {
@@ -370,10 +577,31 @@ export function startProxy(): void {
   const signer = createSigner(config);
   const rl = readline.createInterface({ input: process.stdin, terminal: false });
 
+  // Start warm-up in background if enabled (non-blocking)
+  let warmState: WarmState | null = null;
+  if (config.warm) {
+    warmBackend(config, signer).then((state) => { warmState = state; });
+  }
+
   let pending: Promise<void> = Promise.resolve();
 
   rl.on('line', (line) => {
-    pending = pending.then(() => processLine(line, config, signer)).catch(() => {});
+    pending = pending.then(async () => {
+      // In warm mode, try to serve from cache first
+      if (warmState) {
+        const input = parseInputLine(line);
+        if (input) {
+          // Wait for warm-up to finish before deciding
+          const warmActive = await warmState.ready;
+
+          if (warmActive && tryWarmResponse(input.body, input.requestId, warmState)) {
+            return; // served from cache
+          }
+          // Fall through: warm mode inactive or method not cacheable — forward normally
+        }
+      }
+      await processLine(line, config, signer);
+    }).catch(() => {});
   });
 
   rl.on('close', async () => {

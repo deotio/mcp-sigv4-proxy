@@ -58,6 +58,10 @@ function makeConfig(overrides?: Record<string, unknown>) {
     service: 'test',
     timeoutMs: 180_000,
     retries: 2,
+    warm: false,
+    warmRetries: 5,
+    warmRetryDelayMs: 10_000,
+    warmTimeoutMs: 300_000,
     ...overrides,
   };
 }
@@ -75,6 +79,8 @@ import {
   setLogLevel,
   log,
   MAX_SSE_BUFFER_BYTES,
+  warmBackend,
+  tryWarmResponse,
 } from '../src/proxy.js';
 
 // --- parseEndpointUrl ---
@@ -838,6 +844,277 @@ describe('integration: graceful shutdown', () => {
     );
 
     expect(result.stderr).toContain('received SIGTERM');
+  });
+});
+
+// --- Warm mode unit tests ---
+
+describe('tryWarmResponse', () => {
+  let stdoutSpy: ReturnType<typeof jest.spyOn>;
+  let stderrSpy: ReturnType<typeof jest.spyOn>;
+
+  beforeEach(() => {
+    setLogLevel('DEBUG');
+    stdoutSpy = jest.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    stderrSpy = jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  });
+  afterEach(() => {
+    stdoutSpy.mockRestore();
+    stderrSpy.mockRestore();
+    setLogLevel('ERROR');
+  });
+
+  test('returns true and writes cached initialize response', () => {
+    const state = {
+      ready: Promise.resolve(true),
+      cache: { initialize: { protocolVersion: '2025-03-26', capabilities: {}, serverInfo: { name: 'test' } } },
+      active: true,
+    };
+    const body = '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{}}';
+    const result = tryWarmResponse(body, 1, state);
+    expect(result).toBe(true);
+    const output = JSON.parse((stdoutSpy.mock.calls[0][0] as string).trim());
+    expect(output.id).toBe(1);
+    expect(output.result.protocolVersion).toBe('2025-03-26');
+  });
+
+  test('returns true and writes cached tools/list response', () => {
+    const state = {
+      ready: Promise.resolve(true),
+      cache: { 'tools/list': { tools: [{ name: 'cost-query' }] } },
+      active: true,
+    };
+    const body = '{"jsonrpc":"2.0","method":"tools/list","id":2,"params":{}}';
+    const result = tryWarmResponse(body, 2, state);
+    expect(result).toBe(true);
+    const output = JSON.parse((stdoutSpy.mock.calls[0][0] as string).trim());
+    expect(output.result.tools[0].name).toBe('cost-query');
+  });
+
+  test('returns false for non-cacheable methods', () => {
+    const state = {
+      ready: Promise.resolve(true),
+      cache: { initialize: { protocolVersion: '2025-03-26' } },
+      active: true,
+    };
+    const body = '{"jsonrpc":"2.0","method":"tools/call","id":3,"params":{}}';
+    const result = tryWarmResponse(body, 3, state);
+    expect(result).toBe(false);
+    expect(stdoutSpy).not.toHaveBeenCalled();
+  });
+
+  test('returns false when cache is empty for requested method', () => {
+    const state = {
+      ready: Promise.resolve(true),
+      cache: { initialize: { protocolVersion: '2025-03-26' } },
+      active: true,
+    };
+    const body = '{"jsonrpc":"2.0","method":"tools/list","id":4,"params":{}}';
+    const result = tryWarmResponse(body, 4, state);
+    expect(result).toBe(false);
+  });
+
+  test('returns false for invalid JSON', () => {
+    const state = {
+      ready: Promise.resolve(true),
+      cache: { initialize: {} },
+      active: true,
+    };
+    const result = tryWarmResponse('not json', 1, state);
+    expect(result).toBe(false);
+  });
+
+  test('returns false for notifications (no method match)', () => {
+    const state = {
+      ready: Promise.resolve(true),
+      cache: { initialize: {} },
+      active: true,
+    };
+    const body = '{"jsonrpc":"2.0","method":"notifications/initialized"}';
+    const result = tryWarmResponse(body, null, state);
+    expect(result).toBe(false);
+  });
+});
+
+describe('warmBackend', () => {
+  let stderrSpy: ReturnType<typeof jest.spyOn>;
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    setLogLevel('DEBUG');
+    stderrSpy = jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    originalFetch = globalThis.fetch;
+    process.env.AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE';
+    process.env.AWS_SECRET_ACCESS_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
+  });
+  afterEach(() => {
+    stderrSpy.mockRestore();
+    globalThis.fetch = originalFetch;
+    setLogLevel('ERROR');
+  });
+
+  test('caches initialize and list responses on success', async () => {
+    let callCount = 0;
+    globalThis.fetch = (async () => {
+      callCount++;
+      if (callCount === 1) {
+        // initialize response
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: '__warmup_init__', result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'test' } } }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      // list responses
+      const methods: Record<number, unknown> = {
+        2: { tools: [{ name: 'cost-query' }] },
+        3: { resources: [] },
+        4: { prompts: [] },
+      };
+      return new Response(
+        JSON.stringify({ jsonrpc: '2.0', id: `list_${callCount}`, result: methods[callCount] ?? {} }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    }) as typeof fetch;
+
+    const config = makeConfig({ warm: true, warmRetries: 1, warmRetryDelayMs: 100, warmTimeoutMs: 10_000 });
+    const signer = createSigner(config);
+    const state = await warmBackend(config, signer);
+    const active = await state.ready;
+
+    expect(active).toBe(true);
+    expect(state.active).toBe(true);
+    expect(state.cache.initialize).toBeDefined();
+    expect(state.cache['tools/list']).toBeDefined();
+    expect((state.cache['tools/list'] as { tools: unknown[] }).tools[0]).toEqual({ name: 'cost-query' });
+  });
+
+  test('falls back on stateful server (mcp-session-id header)', async () => {
+    globalThis.fetch = (async () => {
+      return new Response(
+        JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2025-03-26' } }),
+        { status: 200, headers: { 'Content-Type': 'application/json', 'mcp-session-id': 'abc-123' } },
+      );
+    }) as typeof fetch;
+
+    const config = makeConfig({ warm: true, warmRetries: 0, warmRetryDelayMs: 100, warmTimeoutMs: 5_000 });
+    const signer = createSigner(config);
+    const state = await warmBackend(config, signer);
+    const active = await state.ready;
+
+    expect(active).toBe(false);
+    expect(stderrSpy).toHaveBeenCalledWith(
+      expect.stringContaining('stateful servers are not compatible with warm mode'),
+    );
+  });
+
+  test('retries on HTTP 424 and succeeds', async () => {
+    let callCount = 0;
+    globalThis.fetch = (async () => {
+      callCount++;
+      if (callCount === 1) {
+        return new Response('{"message":"cold start"}', { status: 424 });
+      }
+      // Second call succeeds (initialize), subsequent calls are list prefetches
+      return new Response(
+        JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2025-03-26', capabilities: {} } }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    }) as typeof fetch;
+
+    const config = makeConfig({ warm: true, warmRetries: 2, warmRetryDelayMs: 50, warmTimeoutMs: 10_000 });
+    const signer = createSigner(config);
+    const state = await warmBackend(config, signer);
+    const active = await state.ready;
+
+    expect(active).toBe(true);
+    expect(callCount).toBeGreaterThanOrEqual(2);
+  });
+
+  test('returns inactive on persistent failure', async () => {
+    globalThis.fetch = (async () => {
+      return new Response('server error', { status: 500 });
+    }) as typeof fetch;
+
+    const config = makeConfig({ warm: true, warmRetries: 0, warmRetryDelayMs: 50, warmTimeoutMs: 5_000 });
+    const signer = createSigner(config);
+    const state = await warmBackend(config, signer);
+    const active = await state.ready;
+
+    expect(active).toBe(false);
+    expect(state.active).toBe(false);
+  });
+});
+
+// --- Warm mode integration tests ---
+
+describe('integration: warm mode', () => {
+  test('MCP_WARM=1 serves initialize from cache', async () => {
+    // We can't easily mock the backend in integration tests, but we can verify
+    // that the proxy starts and handles warm mode config without crashing
+    const result = await spawnProxy(
+      { ...baseEnv, MCP_WARM: '1', MCP_LOG_LEVEL: 'INFO' },
+      { timeoutMs: 3000 },
+    );
+    expect(result.stderr).toContain('warm mode enabled');
+    expect(result.code).toBe(0);
+  });
+
+  test('MCP_WARM=0 does not enable warm mode', async () => {
+    const result = await spawnProxy(
+      { ...baseEnv, MCP_WARM: '0', MCP_LOG_LEVEL: 'INFO' },
+      { timeoutMs: 3000 },
+    );
+    expect(result.stderr).not.toContain('warm mode enabled');
+  });
+
+  test('warm mode absent by default', async () => {
+    const result = await spawnProxy(
+      { ...baseEnv, MCP_LOG_LEVEL: 'INFO' },
+      { timeoutMs: 3000 },
+    );
+    expect(result.stderr).not.toContain('warm mode enabled');
+  });
+});
+
+describe('integration: warm mode validateEnv', () => {
+  const origEnv = { ...process.env };
+  let stderrSpy: ReturnType<typeof jest.spyOn>;
+
+  beforeEach(() => {
+    stderrSpy = jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  });
+  afterEach(() => {
+    stderrSpy.mockRestore();
+    process.env = { ...origEnv };
+  });
+
+  test('parses MCP_WARM=1', () => {
+    process.env.MCP_SERVER_URL = 'https://example.com';
+    process.env.MCP_WARM = '1';
+    delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+    const config = validateEnv();
+    expect(config.warm).toBe(true);
+  });
+
+  test('MCP_WARM defaults to false', () => {
+    process.env.MCP_SERVER_URL = 'https://example.com';
+    delete process.env.MCP_WARM;
+    delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+    const config = validateEnv();
+    expect(config.warm).toBe(false);
+  });
+
+  test('parses warm config env vars', () => {
+    process.env.MCP_SERVER_URL = 'https://example.com';
+    process.env.MCP_WARM = '1';
+    process.env.MCP_WARM_RETRIES = '3';
+    process.env.MCP_WARM_RETRY_DELAY = '5000';
+    process.env.MCP_WARM_TIMEOUT = '120000';
+    delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+    const config = validateEnv();
+    expect(config.warmRetries).toBe(3);
+    expect(config.warmRetryDelayMs).toBe(5000);
+    expect(config.warmTimeoutMs).toBe(120_000);
   });
 });
 

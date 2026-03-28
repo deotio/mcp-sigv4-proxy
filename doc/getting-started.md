@@ -72,6 +72,29 @@ mcp-sigv4-proxy: HTTP 403: ...
 mcp-sigv4-proxy: request failed: ...
 ```
 
+## Slow-starting backends (AgentCore cold starts)
+
+If your MCP server is hosted on a serverless platform like AWS Bedrock AgentCore Runtime, the first connection may time out because the container takes time to cold-start. Enable warm mode to solve this:
+
+```json
+{
+  "mcpServers": {
+    "my-server": {
+      "command": "npx",
+      "args": ["-y", "@deotio/mcp-sigv4-proxy"],
+      "env": {
+        "MCP_WARM": "1",
+        "AWS_PROFILE": "your-profile-name",
+        "AWS_REGION": "us-east-1",
+        "MCP_SERVER_URL": "https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/your-runtime-id/invocations?qualifier=DEFAULT"
+      }
+    }
+  }
+}
+```
+
+With `MCP_WARM=1`, the proxy warms the backend in the background at startup and responds to the MCP client instantly from cache. See [Configuration — Warm mode](configuration.md#warm-mode) for details.
+
 ## Multiple servers with different profiles
 
 A common use case is connecting to the same MCP server across multiple AWS accounts or environments. Each gets its own `.mcp.json` entry with a different profile:

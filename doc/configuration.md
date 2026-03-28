@@ -72,11 +72,12 @@ Request timeout in seconds. Applies to each individual HTTP request (including r
 "MCP_TIMEOUT": "60"
 ```
 
-### `MCP_RETRIES` (optional, default: `0`)
+### `MCP_RETRIES` (optional, default: `2`)
 
-Number of retries for failed requests (0-10). Retries use exponential backoff (1s, 2s, 4s, ...) and are triggered by:
-- HTTP 5xx server errors
-- Network failures (connection refused, DNS errors)
+Number of retries for failed requests (0-10). Retries are triggered by:
+- HTTP 5xx server errors — exponential backoff (1s, 2s, 4s, ...)
+- HTTP 424 (AgentCore cold-start timeout) — longer backoff (5s, 10s, 20s, ...) to allow the container to finish starting
+- Network failures (connection refused, DNS errors) — exponential backoff (1s, 2s, 4s, ...)
 - Timeouts
 
 ```json
@@ -100,6 +101,62 @@ Controls the verbosity of diagnostic output on stderr. Available levels:
 ```
 
 Note: Some MCP clients (e.g. Cline) scan stderr for the word "error" and misinterpret log messages as failures. The default `ERROR` level minimizes this risk. Use `SILENT` if you encounter false positives.
+
+## Warm mode
+
+Warm mode pre-warms slow-starting backends (like AWS Bedrock AgentCore Runtime) in the background so that the MCP client connects instantly instead of timing out during a cold start.
+
+When enabled, the proxy:
+
+1. **On startup**, immediately sends an MCP `initialize` request to the backend, retrying through HTTP 424 (cold-start timeout) errors with exponential backoff
+2. **After the backend responds**, prefetches `tools/list`, `resources/list`, and `prompts/list` and caches the responses
+3. **When the MCP client sends `initialize`**, responds instantly from cache (or with a synthetic response if the backend hasn't responded yet)
+4. **When the MCP client sends `tools/list` etc.**, responds instantly from cache
+5. **For all other requests** (`tools/call`, etc.), forwards to the backend normally — by this point, the backend is warm
+
+This means the MCP client sees the server as connected with tools listed in under a second, even if the backend takes minutes to cold-start.
+
+### Enabling warm mode
+
+```json
+"env": {
+  "MCP_WARM": "1",
+  "MCP_SERVER_URL": "https://bedrock-agentcore...",
+  "AWS_PROFILE": "my-profile",
+  "AWS_REGION": "us-east-1"
+}
+```
+
+To disable: remove `MCP_WARM` or set it to `0`.
+
+### Warm mode environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `MCP_WARM` | `0` | Set to `1` to enable warm mode |
+| `MCP_WARM_RETRIES` | `5` | Max retries for the background warm-up `initialize` request (0-20) |
+| `MCP_WARM_RETRY_DELAY` | `10000` | Base delay in milliseconds between warm-up retries (minimum 1000). Doubles on each retry. |
+| `MCP_WARM_TIMEOUT` | `300000` | Overall deadline in milliseconds for the warm-up process. If exceeded, warm mode is disabled and the proxy falls back to pass-through. |
+
+### Limitation: stateless servers only
+
+Warm mode is only compatible with **stateless** MCP servers — servers that do not use session IDs (i.e., configured with `sessionIdGenerator: undefined` in the MCP SDK).
+
+If the backend returns an `mcp-session-id` header during the warm-up `initialize` request, warm mode is **automatically disabled** and the proxy falls back to standard pass-through behavior. A warning is logged:
+
+```
+mcp-sigv4-proxy: warm: backend returned mcp-session-id header — stateful servers are not compatible with warm mode. Falling back to pass-through mode.
+```
+
+**How to tell if your server is stateful:** Check the `StreamableHTTPServerTransport` configuration in your server code. If `sessionIdGenerator` is `undefined` or absent, the server is stateless and warm mode is safe. Most MCP servers, including all AgentCore-hosted servers in this project, are stateless.
+
+**What happens on fallback:** The proxy behaves identically to `MCP_WARM=0` — cold-start delays apply, but correctness is preserved. Check proxy logs (`MCP_LOG_LEVEL=INFO`) for the fallback warning.
+
+### Cache behavior
+
+The capability cache (`initialize`, `tools/list`, `resources/list`, `prompts/list`) lives for the lifetime of the proxy process, which matches the MCP client session lifetime. Since tool definitions only change on server redeploy — and a redeploy creates a new container (new cold start, new proxy process) — the cache is always fresh for the current server version. No TTL or manual invalidation is needed.
+
+If the MCP client requests `tools/list` a second time (e.g., after a `notifications/tools/list_changed` event), the proxy forwards the request to the backend and updates the cache.
 
 ## AWS credential methods
 

@@ -96,9 +96,36 @@ The upstream server didn't respond within the configured timeout (default: 180 s
 
 Increase the timeout with `MCP_TIMEOUT` (in seconds) or add retries with `MCP_RETRIES`.
 
+### `mcp-sigv4-proxy: HTTP 424: Runtime initialization time exceeded...`
+
+The backend (typically AgentCore) is cold-starting and hasn't finished within its initialization limit. The proxy retries HTTP 424 automatically with longer backoff intervals (5s, 10s, 20s, ...) to give the container time to start.
+
+If you see this frequently, consider enabling [warm mode](configuration.md#warm-mode) (`MCP_WARM=1`) which pre-warms the backend in the background so the MCP client connects instantly.
+
 ### `mcp-sigv4-proxy: HTTP 500, retrying (1/3)`
 
-The upstream returned a server error and the proxy is retrying. Configure retry count with `MCP_RETRIES` (0-10, default 0). Retries use exponential backoff.
+The upstream returned a server error and the proxy is retrying. Configure retry count with `MCP_RETRIES` (0-10, default 2). Retries use exponential backoff.
+
+## Warm mode
+
+### Warm mode enabled but server still slow to connect
+
+Check proxy logs (`MCP_LOG_LEVEL=INFO`) for one of these messages:
+
+- **`warm: backend returned mcp-session-id header — stateful servers are not compatible with warm mode. Falling back to pass-through mode.`** — The backend uses session IDs (stateful mode). Warm mode cannot help. Solutions: make the server stateless (`sessionIdGenerator: undefined`), or rely on keepalive mechanisms instead.
+- **`warm: backend did not respond to initialize within timeout`** — The warm-up timed out. Increase `MCP_WARM_TIMEOUT` or `MCP_WARM_RETRIES`. The backend may be down or unreachable.
+- **`warm: initialize failed with HTTP <status>`** — The backend returned a non-retryable error (not 424 or 5xx). Check authentication and IAM permissions.
+
+### Tools not showing up after connection
+
+If the MCP client connects (shows the server as active) but no tools appear:
+
+1. The backend may still be cold-starting when `tools/list` was requested. If the warm-up cache wasn't populated yet, the proxy forwards the request to the backend and waits. Check logs for `warm: ready` to confirm the warm-up completed.
+2. The backend itself may have no tools registered. Test directly with `awscurl` or check the server logs.
+
+### `warm: cold-start (HTTP 424), retrying in Xms`
+
+This is expected behavior during warm-up. The backend is still starting and the proxy is waiting for it. No action needed — the proxy will keep retrying until the backend is ready or the timeout is reached.
 
 ## Debugging tips
 
