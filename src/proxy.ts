@@ -3,6 +3,11 @@ import { SignatureV4 } from '@smithy/signature-v4';
 import { HttpRequest } from '@smithy/protocol-http';
 import { Sha256 } from '@aws-crypto/sha256-js';
 import readline from 'readline';
+import { createRequire } from 'module';
+
+const { version: PROXY_VERSION } = createRequire(import.meta.url)('../package.json') as {
+  version: string;
+};
 
 export const MAX_SSE_BUFFER_BYTES = 1_048_576; // 1 MB
 const DEFAULT_TIMEOUT_MS = 180_000; // 180s, matches AWS proxy
@@ -412,7 +417,7 @@ function syntheticInitializeResult(): unknown {
   return {
     protocolVersion: '2025-03-26',
     capabilities: { tools: {}, resources: {}, prompts: {} },
-    serverInfo: { name: 'mcp-sigv4-proxy-warm', version: '0.4.1' },
+    serverInfo: { name: 'mcp-sigv4-proxy-warm', version: PROXY_VERSION },
   };
 }
 
