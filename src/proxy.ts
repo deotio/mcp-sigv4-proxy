@@ -32,7 +32,7 @@ const LOG_LEVEL_ORDER: Record<LogLevel, number> = {
   SILENT: 4,
 };
 
-let currentLogLevel: LogLevel = 'ERROR';
+let currentLogLevel: LogLevel = 'INFO';
 
 export function setLogLevel(level: LogLevel): void {
   currentLogLevel = level;
@@ -110,10 +110,14 @@ export function validateEnv(): ProxyConfig {
   const region = process.env.AWS_REGION || inferred?.region || 'us-east-1';
   const service = process.env.AWS_SERVICE || inferred?.service || 'bedrock-agentcore';
 
-  // Parse log level
-  const envLogLevel = (process.env.MCP_LOG_LEVEL ?? 'ERROR').toUpperCase();
-  if (envLogLevel in LOG_LEVEL_ORDER) {
-    setLogLevel(envLogLevel as LogLevel);
+  // Parse log level — only override the default if explicitly set
+  if (process.env.MCP_LOG_LEVEL) {
+    const envLogLevel = process.env.MCP_LOG_LEVEL.toUpperCase();
+    if (envLogLevel in LOG_LEVEL_ORDER) {
+      setLogLevel(envLogLevel as LogLevel);
+    } else {
+      log('WARNING', `unknown MCP_LOG_LEVEL value "${process.env.MCP_LOG_LEVEL}", using default`);
+    }
   }
 
   // Parse timeout
@@ -361,9 +365,22 @@ export async function processLine(
   const { body, requestId } = input;
   const request = buildHttpRequest(config.url, body);
 
+  let signed: Awaited<ReturnType<typeof signer.sign>>;
   try {
-    const signed = await signer.sign(request);
+    signed = await signer.sign(request);
+  } catch (err) {
+    log('ERROR', `signing failed (check AWS credentials for profile/env): ${err}`);
+    process.stdout.write(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: requestId,
+        error: { code: -32000, message: 'Request signing failed — check AWS credentials' },
+      }) + '\n',
+    );
+    return;
+  }
 
+  try {
     log('DEBUG', `-> POST ${config.url.pathname}`);
 
     const response = await fetchWithRetry(
@@ -464,12 +481,26 @@ export async function warmBackend(
           continue;
         }
 
-        log('WARNING', `warm: initialize failed with HTTP ${initResponse.status}`);
+        const hint =
+          initResponse.status === 403
+            ? ' (check IAM permissions for the calling identity)'
+            : initResponse.status === 404
+              ? ' (check MCP_SERVER_URL — endpoint not found)'
+              : initResponse.status === 406
+                ? ' (server rejected request — possibly missing Accept header)'
+                : '';
+        log('ERROR', `warm: initialize failed with HTTP ${initResponse.status}${hint}`);
         return false;
       } catch (err) {
+        const isCredentialError =
+          err instanceof Error &&
+          (err.message.includes('credential') ||
+            err.message.includes('Could not load credentials') ||
+            err.message.includes('profile'));
         if (attempt < config.warmRetries) {
           const delay = config.warmRetryDelayMs * Math.pow(2, attempt);
-          log('WARNING', `warm: initialize error (${err}), retrying in ${delay}ms`);
+          log(isCredentialError ? 'ERROR' : 'WARNING',
+            `warm: initialize ${isCredentialError ? 'credential error' : 'error'} (${err}), retrying in ${delay}ms (${attempt + 1}/${config.warmRetries})`);
           await sleep(Math.min(delay, deadline - Date.now()));
           continue;
         }
@@ -522,11 +553,35 @@ export async function warmBackend(
         );
         if (response.ok) {
           const body = await response.text();
-          const parsed = JSON.parse(body);
-          if (parsed.result) {
+          const ct = response.headers.get('content-type') ?? '';
+          let parsed: Record<string, unknown> | null = null;
+          if (ct.includes('text/event-stream')) {
+            // Extract the first data: line from the SSE stream
+            const dataLine = body.split('\n').find((l) => l.startsWith('data: '));
+            if (dataLine) {
+              try {
+                parsed = JSON.parse(dataLine.slice(6).trim());
+              } catch {
+                log('WARNING', `warm: ${method} SSE data line is not valid JSON`);
+              }
+            } else {
+              log('WARNING', `warm: ${method} returned SSE but contained no data: lines`);
+            }
+          } else {
+            try {
+              parsed = JSON.parse(body);
+            } catch {
+              log('WARNING', `warm: ${method} response is not valid JSON (content-type: ${ct})`);
+            }
+          }
+          if (parsed?.result) {
             state.cache[method] = parsed.result;
             log('DEBUG', `warm: cached ${method} (${JSON.stringify(parsed.result).length} bytes)`);
+          } else if (parsed) {
+            log('WARNING', `warm: ${method} response had no .result field`);
           }
+        } else {
+          log('WARNING', `warm: prefetch ${method} failed with HTTP ${response.status}`);
         }
       } catch (err) {
         log('WARNING', `warm: failed to prefetch ${method}: ${err}`);
@@ -603,9 +658,11 @@ export async function handleWarmLine(
     // List methods: serve from cache immediately if available…
     if (tryWarmResponse(input.body, input.requestId, ws)) return true;
     // …otherwise wait for warm-up to complete, then try cache again before forwarding
-    await ws.ready;
+    log('INFO', `warm: cache miss for ${method}, waiting for warm-up to complete`);
+    const warmed = await ws.ready;
+    log('INFO', `warm: warm-up ${warmed ? 'succeeded' : 'failed'} — ${method} ${warmed ? 'served from cache' : 'forwarding to backend'}`);
     if (tryWarmResponse(input.body, input.requestId, ws)) return true;
-    // Fall through to forward if warm-up failed or cache still empty
+    log('INFO', `warm: cache still empty for ${method}, forwarding to backend`);
   }
   // Non-cacheable methods (tools/call etc): return false to forward normally.
   // fetchWithRetry handles any residual 424s if the backend isn't warm yet.
@@ -615,6 +672,7 @@ export async function handleWarmLine(
 // --- Main entry ---
 
 export function startProxy(): void {
+  log('INFO', `v${PROXY_VERSION} starting`);
   const config = validateEnv();
   const signer = createSigner(config);
   const rl = readline.createInterface({ input: process.stdin, terminal: false });
@@ -638,7 +696,9 @@ export function startProxy(): void {
         }
       }
       await processLine(line, config, signer);
-    }).catch(() => {});
+    }).catch((err) => {
+      log('ERROR', `unhandled error in line processing: ${err}`);
+    });
   });
 
   rl.on('close', async () => {
