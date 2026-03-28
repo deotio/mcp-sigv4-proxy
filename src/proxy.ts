@@ -412,7 +412,7 @@ function syntheticInitializeResult(): unknown {
   return {
     protocolVersion: '2025-03-26',
     capabilities: { tools: {}, resources: {}, prompts: {} },
-    serverInfo: { name: 'mcp-sigv4-proxy-warm', version: '0.4.0' },
+    serverInfo: { name: 'mcp-sigv4-proxy-warm', version: '0.4.1' },
   };
 }
 
