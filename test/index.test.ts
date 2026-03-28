@@ -62,6 +62,7 @@ function makeConfig(overrides?: Record<string, unknown>) {
     warmRetries: 5,
     warmRetryDelayMs: 10_000,
     warmTimeoutMs: 300_000,
+    signTimeoutMs: 10_000,
     ...overrides,
   };
 }
@@ -76,6 +77,8 @@ import {
   processLine,
   validateEnv,
   createSigner,
+  signWithTimeout,
+  probeCredentials,
   setLogLevel,
   log,
   MAX_SSE_BUFFER_BYTES,
@@ -204,12 +207,21 @@ describe('parseInputLine', () => {
     expect(result).not.toBeNull();
     expect(result!.requestId).toBe(42);
     expect(result!.body).toBe('{"jsonrpc": "2.0", "method": "test", "id": 42}');
+    expect(result!.isNotification).toBe(false);
   });
 
-  test('parses notification (no id) with requestId null', () => {
+  test('marks notification (no id field) as isNotification=true', () => {
     const result = parseInputLine('{"jsonrpc": "2.0", "method": "notifications/initialized"}');
     expect(result).not.toBeNull();
     expect(result!.requestId).toBeNull();
+    expect(result!.isNotification).toBe(true);
+  });
+
+  test('marks request with id:null as isNotification=false', () => {
+    const result = parseInputLine('{"jsonrpc": "2.0", "method": "test", "id": null}');
+    expect(result).not.toBeNull();
+    expect(result!.requestId).toBeNull();
+    expect(result!.isNotification).toBe(false);
   });
 });
 
@@ -229,6 +241,7 @@ describe('buildHttpRequest', () => {
       Object.entries(req.headers).map(([k, v]) => [k.toLowerCase(), v]),
     );
     expect(headers['content-type']).toBe('application/json');
+    expect(headers['accept']).toBe('application/json, text/event-stream');
     expect(headers['host']).toBe('example.com');
     expect(headers['content-length']).toBe(String(Buffer.byteLength(body)));
     expect(req.body).toBe(body);
@@ -670,6 +683,30 @@ describe('processLine', () => {
     expect(output.error.message).toContain('signing failed');
   });
 
+  test('does not write to stdout for notification when signing fails', async () => {
+    const config = makeConfig();
+    const badSigner = {
+      sign: async () => { throw new Error('Could not load credentials from any providers'); },
+    } as unknown as ReturnType<typeof createSigner>;
+
+    await processLine('{"jsonrpc":"2.0","method":"notifications/initialized"}', config, badSigner);
+
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('signing failed'));
+    expect(stdoutSpy).not.toHaveBeenCalled();
+  });
+
+  test('does not write to stdout for notification on network error', async () => {
+    process.env.AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE';
+    process.env.AWS_SECRET_ACCESS_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
+
+    const config = makeConfig({ url: new URL('https://127.0.0.1:1'), retries: 0 });
+    const signer = createSigner(config);
+    await processLine('{"jsonrpc":"2.0","method":"notifications/initialized"}', config, signer);
+
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('request failed'));
+    expect(stdoutSpy).not.toHaveBeenCalled();
+  });
+
   test('timeout produces specific error message', async () => {
     process.env.AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE';
     process.env.AWS_SECRET_ACCESS_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
@@ -795,7 +832,7 @@ describe('integration: request forwarding', () => {
     expect(output.error.code).toBe(-32000);
   });
 
-  test('notification error has id: null', async () => {
+  test('notification produces no stdout output', async () => {
     const result = await spawnProxy(
       { ...baseEnv, MCP_SERVER_URL: 'https://127.0.0.1:1', MCP_RETRIES: '0' },
       {
@@ -804,8 +841,8 @@ describe('integration: request forwarding', () => {
       },
     );
 
-    const output = JSON.parse(result.stdout.trim());
-    expect(output.id).toBeNull();
+    // Notifications must never produce a JSON-RPC response on stdout
+    expect(result.stdout.trim()).toBe('');
   });
 });
 
@@ -1220,6 +1257,47 @@ describe('warmBackend', () => {
     expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('failed after'));
   });
 
+  test('returns false immediately on credential error without retrying', async () => {
+    let callCount = 0;
+    globalThis.fetch = (async () => {
+      callCount++;
+      throw new Error('Could not load credentials from any providers');
+    }) as typeof fetch;
+
+    // warmRetries: 3 — but credential errors should bail on the first attempt
+    const config = makeConfig({ warm: true, warmRetries: 3, warmRetryDelayMs: 50, warmTimeoutMs: 10_000 });
+    const signer = createSigner(config);
+    const state = await warmBackend(config, signer);
+    const active = await state.ready;
+
+    expect(active).toBe(false);
+    expect(callCount).toBe(1); // no retries
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('credential error'));
+  });
+
+  test('does not retry prefetch on credential error', async () => {
+    let callCount = 0;
+    globalThis.fetch = (async () => {
+      callCount++;
+      if (callCount === 1) {
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: '__warmup_init__', result: { protocolVersion: '2025-03-26', capabilities: {} } }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      throw new Error('Could not load credentials from any providers');
+    }) as typeof fetch;
+
+    const config = makeConfig({ warm: true, warmRetries: 0, warmRetryDelayMs: 50, warmTimeoutMs: 10_000 });
+    const signer = createSigner(config);
+    const state = await warmBackend(config, signer);
+    const active = await state.ready;
+
+    // Overall warm-up still succeeds (initialize worked), but lists are uncached
+    expect(active).toBe(true);
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('credential error during prefetch'));
+  });
+
   test('caches tools/list from SSE prefetch response', async () => {
     let callCount = 0;
     globalThis.fetch = (async () => {
@@ -1518,5 +1596,98 @@ describe('integration: log level', () => {
     );
 
     expect(result.stderr).toContain('unknown MCP_LOG_LEVEL value "VERBOSE"');
+  });
+});
+
+// --- signWithTimeout ---
+
+describe('signWithTimeout', () => {
+  let stderrSpy: ReturnType<typeof jest.spyOn>;
+
+  beforeEach(() => {
+    setLogLevel('DEBUG');
+    stderrSpy = jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  });
+  afterEach(() => {
+    stderrSpy.mockRestore();
+    setLogLevel('ERROR');
+  });
+
+  test('resolves with signed request when sign completes within timeout', async () => {
+    const fakeResult = { headers: { authorization: 'AWS4-HMAC-SHA256 ...' } };
+    const fastSigner = {
+      sign: async () => fakeResult,
+    } as unknown as ReturnType<typeof createSigner>;
+
+    const req = buildHttpRequest(new URL('https://example.com'), '{}');
+    const result = await signWithTimeout(fastSigner, req, 5000);
+    expect(result).toBe(fakeResult);
+  });
+
+  test('rejects with timeout error when sign exceeds timeout', async () => {
+    const hangingSigner = {
+      sign: () => new Promise<never>(() => {}), // never resolves
+    } as unknown as ReturnType<typeof createSigner>;
+
+    const req = buildHttpRequest(new URL('https://example.com'), '{}');
+    await expect(signWithTimeout(hangingSigner, req, 50)).rejects.toThrow(
+      /credential resolution timed out/,
+    );
+  });
+
+  test('clears the timer on success (no leak)', async () => {
+    const clearSpy = jest.spyOn(globalThis, 'clearTimeout');
+    const fastSigner = {
+      sign: async () => ({ headers: {} }),
+    } as unknown as ReturnType<typeof createSigner>;
+
+    const req = buildHttpRequest(new URL('https://example.com'), '{}');
+    await signWithTimeout(fastSigner, req, 5000);
+    expect(clearSpy).toHaveBeenCalled();
+    clearSpy.mockRestore();
+  });
+});
+
+// --- probeCredentials ---
+
+describe('probeCredentials', () => {
+  let stderrSpy: ReturnType<typeof jest.spyOn>;
+  const origEnv = { ...process.env };
+
+  beforeEach(() => {
+    setLogLevel('DEBUG');
+    stderrSpy = jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  });
+  afterEach(() => {
+    stderrSpy.mockRestore();
+    setLogLevel('ERROR');
+    process.env = { ...origEnv };
+  });
+
+  test('logs INFO when credentials resolve successfully', async () => {
+    process.env.AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE';
+    process.env.AWS_SECRET_ACCESS_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
+    process.env.AWS_REGION = 'us-east-1';
+    delete process.env.AWS_PROFILE;
+
+    await probeCredentials(5000);
+
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('credentials OK'));
+  });
+
+  test('logs ERROR when provider times out', async () => {
+    // Use a 1ms timeout — even with valid env creds the provider chain check
+    // should time out before the synchronous env provider can run... but if it
+    // doesn't, we fall back to asserting the probe completed without throwing.
+    // Use a definitely-invalid profile to force a slow/failing lookup instead.
+    delete process.env.AWS_ACCESS_KEY_ID;
+    delete process.env.AWS_SECRET_ACCESS_KEY;
+    process.env.AWS_PROFILE = 'nonexistent-profile-for-testing';
+
+    await probeCredentials(1); // 1ms — will time out
+
+    expect(stderrSpy).toHaveBeenCalledWith(
+      expect.stringContaining('credential probe failed'),
+    );
   });
 });

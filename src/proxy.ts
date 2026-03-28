@@ -19,6 +19,7 @@ const COLD_START_RETRY_MS = 5000;
 const DEFAULT_WARM_RETRIES = 5;
 const DEFAULT_WARM_RETRY_DELAY_MS = 10_000;
 const DEFAULT_WARM_TIMEOUT_MS = 300_000; // 5 min
+const DEFAULT_SIGN_TIMEOUT_MS = 10_000; // 10 s — fail fast if credentials are unavailable
 
 // --- Log levels ---
 
@@ -76,6 +77,7 @@ export interface ProxyConfig {
   warmRetries: number;
   warmRetryDelayMs: number;
   warmTimeoutMs: number;
+  signTimeoutMs: number;
 }
 
 export function validateEnv(): ProxyConfig {
@@ -127,6 +129,11 @@ export function validateEnv(): ProxyConfig {
     ? Number(process.env.MCP_TIMEOUT) * 1000
     : DEFAULT_TIMEOUT_MS;
 
+  // Parse signing timeout
+  const signTimeoutMs = process.env.MCP_SIGN_TIMEOUT
+    ? Number(process.env.MCP_SIGN_TIMEOUT) * 1000
+    : DEFAULT_SIGN_TIMEOUT_MS;
+
   // Parse retries
   const retries = process.env.MCP_RETRIES
     ? Math.min(Math.max(0, Math.floor(Number(process.env.MCP_RETRIES))), 10)
@@ -153,7 +160,7 @@ export function validateEnv(): ProxyConfig {
     log('INFO', `warm mode enabled (retries: ${warmRetries}, delay: ${warmRetryDelayMs}ms, timeout: ${warmTimeoutMs}ms)`);
   }
 
-  return { url, region, service, timeoutMs, retries, warm, warmRetries, warmRetryDelayMs, warmTimeoutMs };
+  return { url, region, service, timeoutMs, retries, warm, warmRetries, warmRetryDelayMs, warmTimeoutMs, signTimeoutMs };
 }
 
 export function createSigner(config: ProxyConfig): SignatureV4 {
@@ -165,9 +172,55 @@ export function createSigner(config: ProxyConfig): SignatureV4 {
   });
 }
 
+export async function signWithTimeout(
+  signer: SignatureV4,
+  request: HttpRequest,
+  timeoutMs: number,
+): Promise<Awaited<ReturnType<SignatureV4['sign']>>> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`credential resolution timed out after ${timeoutMs}ms — ` +
+        'run: aws sso login --profile <your-profile>')),
+      timeoutMs,
+    );
+  });
+  try {
+    return await Promise.race([signer.sign(request), timeout]);
+  } finally {
+    clearTimeout(timer!);
+  }
+}
+
+export async function probeCredentials(
+  timeoutMs = 5_000,
+): Promise<void> {
+  const provider = fromNodeProviderChain();
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+  });
+  try {
+    await Promise.race([provider(), timeout]);
+    log('INFO', `credentials OK (profile: ${process.env.AWS_PROFILE ?? 'default'})`);
+  } catch (err) {
+    log('ERROR',
+      `credential probe failed — AWS requests will fail until credentials are refreshed.\n` +
+      `  Run: aws sso login --profile ${process.env.AWS_PROFILE ?? '<profile>'}\n` +
+      `  Details: ${err}`);
+  } finally {
+    clearTimeout(timer!);
+  }
+}
+
 // --- Input parsing ---
 
-export function parseInputLine(line: string): { body: string; requestId: unknown } | null {
+export function parseInputLine(
+  line: string,
+): { body: string; requestId: unknown; isNotification: boolean } | null {
   const body = line.trim();
   if (!body) return null;
 
@@ -189,7 +242,8 @@ export function parseInputLine(line: string): { body: string; requestId: unknown
   }
 
   const requestId = (parsed as Record<string, unknown>).id ?? null;
-  return { body, requestId };
+  const isNotification = !('id' in (parsed as Record<string, unknown>));
+  return { body, requestId, isNotification };
 }
 
 // --- Request building ---
@@ -207,6 +261,7 @@ export function buildHttpRequest(url: URL, body: string): HttpRequest {
     ...(Object.keys(query).length > 0 && { query }),
     headers: {
       'Content-Type': 'application/json',
+      'Accept': 'application/json, text/event-stream',
       'Content-Length': String(Buffer.byteLength(body)),
       host: url.hostname,
     },
@@ -364,21 +419,23 @@ export async function processLine(
   const input = parseInputLine(line);
   if (!input) return;
 
-  const { body, requestId } = input;
+  const { body, requestId, isNotification } = input;
   const request = buildHttpRequest(config.url, body);
 
   let signed: Awaited<ReturnType<typeof signer.sign>>;
   try {
-    signed = await signer.sign(request);
+    signed = await signWithTimeout(signer, request, config.signTimeoutMs);
   } catch (err) {
     log('ERROR', `signing failed (check AWS credentials for profile/env): ${err}`);
-    process.stdout.write(
-      JSON.stringify({
-        jsonrpc: '2.0',
-        id: requestId,
-        error: { code: -32000, message: 'Request signing failed — check AWS credentials' },
-      }) + '\n',
-    );
+    if (!isNotification) {
+      process.stdout.write(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: requestId,
+          error: { code: -32000, message: 'Request signing failed — check AWS credentials' },
+        }) + '\n',
+      );
+    }
     return;
   }
 
@@ -401,13 +458,15 @@ export async function processLine(
     const isTimeout = err instanceof DOMException && err.name === 'AbortError';
     const message = isTimeout ? 'Request timed out' : 'Proxy request failed';
     log('ERROR', `request failed: ${err}`);
-    process.stdout.write(
-      JSON.stringify({
-        jsonrpc: '2.0',
-        id: requestId,
-        error: { code: -32000, message },
-      }) + '\n',
-    );
+    if (!isNotification) {
+      process.stdout.write(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: requestId,
+          error: { code: -32000, message },
+        }) + '\n',
+      );
+    }
   }
 }
 
@@ -457,7 +516,7 @@ export async function warmBackend(
       params: {
         protocolVersion: '2025-03-26',
         capabilities: {},
-        clientInfo: { name: 'mcp-sigv4-proxy', version: '0.4.0' },
+        clientInfo: { name: 'mcp-sigv4-proxy', version: PROXY_VERSION },
       },
     });
 
@@ -466,7 +525,7 @@ export async function warmBackend(
       if (Date.now() >= deadline) break;
       try {
         const request = buildHttpRequest(config.url, initBody);
-        const signed = await signer.sign(request);
+        const signed = await signWithTimeout(signer, request, config.signTimeoutMs);
         initResponse = await fetchWithTimeout(
           config.url.toString(),
           { method: 'POST', headers: signed.headers as Record<string, string>, body: initBody },
@@ -498,11 +557,20 @@ export async function warmBackend(
           err instanceof Error &&
           (err.message.includes('credential') ||
             err.message.includes('Could not load credentials') ||
-            err.message.includes('profile'));
+            err.message.includes('profile') ||
+            err.message.includes('timed out')); // catches signWithTimeout errors
+
+        if (isCredentialError) {
+          // No point retrying — expired tokens won't fix themselves.
+          log('ERROR', `warm: credential error — aborting warm-up. ` +
+            `Run: aws sso login --profile <your-profile>\n  Details: ${err}`);
+          return false;
+        }
+
         if (attempt < config.warmRetries) {
           const delay = config.warmRetryDelayMs * Math.pow(2, attempt);
-          log(isCredentialError ? 'ERROR' : 'WARNING',
-            `warm: initialize ${isCredentialError ? 'credential error' : 'error'} (${err}), retrying in ${delay}ms (${attempt + 1}/${config.warmRetries})`);
+          log('WARNING',
+            `warm: initialize error (${err}), retrying in ${delay}ms (${attempt + 1}/${config.warmRetries})`);
           await sleep(Math.min(delay, deadline - Date.now()));
           continue;
         }
@@ -547,7 +615,7 @@ export async function warmBackend(
           jsonrpc: '2.0', id: `__warmup_${method}__`, method, params: {},
         });
         const request = buildHttpRequest(config.url, listBody);
-        const signed = await signer.sign(request);
+        const signed = await signWithTimeout(signer, request, config.signTimeoutMs);
         const response = await fetchWithTimeout(
           config.url.toString(),
           { method: 'POST', headers: signed.headers as Record<string, string>, body: listBody },
@@ -586,7 +654,17 @@ export async function warmBackend(
           log('WARNING', `warm: prefetch ${method} failed with HTTP ${response.status}`);
         }
       } catch (err) {
-        log('WARNING', `warm: failed to prefetch ${method}: ${err}`);
+        const isCredentialError =
+          err instanceof Error &&
+          (err.message.includes('credential') ||
+            err.message.includes('Could not load credentials') ||
+            err.message.includes('profile') ||
+            err.message.includes('timed out'));
+        if (isCredentialError) {
+          log('ERROR', `warm: credential error during prefetch of ${method} — skipping. Details: ${err}`);
+        } else {
+          log('WARNING', `warm: failed to prefetch ${method}: ${err}`);
+        }
       }
     }));
 
@@ -674,6 +752,10 @@ export async function handleWarmLine(
 export function startProxy(): void {
   const config = validateEnv();
   const signer = createSigner(config);
+
+  // Non-blocking credential check — surfaces expired SSO immediately.
+  probeCredentials().catch(() => { /* already logged inside */ });
+
   const rl = readline.createInterface({ input: process.stdin, terminal: false });
 
   // Start warm-up immediately. warmBackend() has no awaits before returning the WarmState
