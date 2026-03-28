@@ -573,6 +573,40 @@ export function tryWarmResponse(
   return true;
 }
 
+/**
+ * Handle a single parsed JSON-RPC message in warm mode.
+ * Returns true if the message was served locally (no need to forward to backend).
+ */
+export async function handleWarmLine(
+  input: { body: string; requestId: unknown },
+  ws: WarmState,
+): Promise<boolean> {
+  const method = (JSON.parse(input.body) as Record<string, unknown>).method as string;
+
+  if (method === 'initialize') {
+    // Respond IMMEDIATELY — never block on ws.ready here.
+    // This is the critical path: Claude Code's 30s timeout applies to this response.
+    const result = ws.cache.initialize ?? syntheticInitializeResult();
+    process.stdout.write(
+      JSON.stringify({ jsonrpc: '2.0', id: input.requestId, result }) + '\n',
+    );
+    log('DEBUG', `warm: served initialize ${ws.cache.initialize ? 'from cache' : 'synthetic'}`);
+    return true;
+  }
+
+  if (WARM_CACHEABLE.has(method)) {
+    // List methods: serve from cache immediately if available…
+    if (tryWarmResponse(input.body, input.requestId, ws)) return true;
+    // …otherwise wait for warm-up to complete, then try cache again before forwarding
+    await ws.ready;
+    if (tryWarmResponse(input.body, input.requestId, ws)) return true;
+    // Fall through to forward if warm-up failed or cache still empty
+  }
+  // Non-cacheable methods (tools/call etc): return false to forward normally.
+  // fetchWithRetry handles any residual 424s if the backend isn't warm yet.
+  return false;
+}
+
 // --- Main entry ---
 
 export function startProxy(): void {
@@ -594,33 +628,8 @@ export function startProxy(): void {
       if (warmStateP) {
         const input = parseInputLine(line);
         if (input) {
-          // warmStateP itself resolves almost instantly (no awaits in warmBackend before return)
-          const ws = await warmStateP;
-
-          // Parse method from already-validated JSON-RPC body
-          const method = (JSON.parse(input.body) as Record<string, unknown>).method as string;
-
-          if (method === 'initialize') {
-            // Respond IMMEDIATELY — never block on warmState.ready here.
-            // This is the critical path: Claude Code's 30s timeout applies to this response.
-            const result = ws.cache.initialize ?? syntheticInitializeResult();
-            process.stdout.write(
-              JSON.stringify({ jsonrpc: '2.0', id: input.requestId, result }) + '\n',
-            );
-            log('DEBUG', `warm: served initialize ${ws.cache.initialize ? 'from cache' : 'synthetic'}`);
-            return;
-          }
-
-          if (WARM_CACHEABLE.has(method)) {
-            // List methods: serve from cache immediately if available…
-            if (tryWarmResponse(input.body, input.requestId, ws)) return;
-            // …otherwise wait for warm-up to complete, then try cache again before forwarding
-            await ws.ready;
-            if (tryWarmResponse(input.body, input.requestId, ws)) return;
-            // Fall through to forward if warm-up failed or cache still empty
-          }
-          // Non-cacheable methods (tools/call etc): fall through to forward.
-          // fetchWithRetry handles any residual 424s if the backend isn't warm yet.
+          const ws = await warmStateP; // resolves almost instantly
+          if (await handleWarmLine(input, ws)) return;
         }
       }
       await processLine(line, config, signer);

@@ -81,6 +81,7 @@ import {
   MAX_SSE_BUFFER_BYTES,
   warmBackend,
   tryWarmResponse,
+  handleWarmLine,
 } from '../src/proxy.js';
 
 // --- parseEndpointUrl ---
@@ -936,6 +937,84 @@ describe('tryWarmResponse', () => {
   });
 });
 
+describe('handleWarmLine', () => {
+  let stdoutSpy: ReturnType<typeof jest.spyOn>;
+  let stderrSpy: ReturnType<typeof jest.spyOn>;
+
+  beforeEach(() => {
+    setLogLevel('DEBUG');
+    stdoutSpy = jest.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    stderrSpy = jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  });
+  afterEach(() => {
+    stdoutSpy.mockRestore();
+    stderrSpy.mockRestore();
+    setLogLevel('ERROR');
+  });
+
+  function makeWarmState(cache: Record<string, unknown> = {}, readyResult = true): Parameters<typeof handleWarmLine>[1] {
+    return { ready: Promise.resolve(readyResult), cache, active: readyResult };
+  }
+
+  test('returns true and serves initialize from cache immediately', async () => {
+    const ws = makeWarmState({ initialize: { protocolVersion: '2025-03-26', capabilities: {} } });
+    const input = { body: '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{}}', requestId: 1 };
+    const result = await handleWarmLine(input, ws);
+    expect(result).toBe(true);
+    const out = JSON.parse((stdoutSpy.mock.calls[0][0] as string).trim());
+    expect(out.result.protocolVersion).toBe('2025-03-26');
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('from cache'));
+  });
+
+  test('returns true and serves synthetic initialize when cache empty', async () => {
+    const ws = makeWarmState({});
+    const input = { body: '{"jsonrpc":"2.0","method":"initialize","id":2,"params":{}}', requestId: 2 };
+    const result = await handleWarmLine(input, ws);
+    expect(result).toBe(true);
+    const out = JSON.parse((stdoutSpy.mock.calls[0][0] as string).trim());
+    expect(out.id).toBe(2);
+    expect(out.result.protocolVersion).toBeDefined();
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('synthetic'));
+  });
+
+  test('returns true and serves tools/list from cache without awaiting ready', async () => {
+    // ready never resolves — if handleWarmLine awaits it, test would hang
+    const neverReady = new Promise<boolean>(() => {});
+    const ws = { ready: neverReady, cache: { 'tools/list': { tools: [{ name: 'q' }] } }, active: true };
+    const input = { body: '{"jsonrpc":"2.0","method":"tools/list","id":3,"params":{}}', requestId: 3 };
+    const result = await handleWarmLine(input, ws);
+    expect(result).toBe(true);
+    const out = JSON.parse((stdoutSpy.mock.calls[0][0] as string).trim());
+    expect(out.result.tools[0].name).toBe('q');
+  });
+
+  test('awaits ready and serves tools/list from cache when not initially cached', async () => {
+    // Cache is empty at first, but ready resolves and populates cache
+    const ws = makeWarmState({}, true);
+    // Simulate cache being populated when ready resolves
+    ws.cache['tools/list'] = { tools: [] };
+    const input = { body: '{"jsonrpc":"2.0","method":"tools/list","id":4,"params":{}}', requestId: 4 };
+    const result = await handleWarmLine(input, ws);
+    expect(result).toBe(true);
+  });
+
+  test('returns false for tools/list when warm-up failed and cache empty', async () => {
+    const ws = makeWarmState({}, false); // warm-up failed
+    const input = { body: '{"jsonrpc":"2.0","method":"tools/list","id":5,"params":{}}', requestId: 5 };
+    const result = await handleWarmLine(input, ws);
+    expect(result).toBe(false);
+    expect(stdoutSpy).not.toHaveBeenCalled();
+  });
+
+  test('returns false for non-cacheable methods', async () => {
+    const ws = makeWarmState({ initialize: {} });
+    const input = { body: '{"jsonrpc":"2.0","method":"tools/call","id":6,"params":{}}', requestId: 6 };
+    const result = await handleWarmLine(input, ws);
+    expect(result).toBe(false);
+    expect(stdoutSpy).not.toHaveBeenCalled();
+  });
+});
+
 describe('warmBackend', () => {
   let stderrSpy: ReturnType<typeof jest.spyOn>;
   let originalFetch: typeof globalThis.fetch;
@@ -1109,6 +1188,44 @@ describe('warmBackend', () => {
     // Still succeeds even if list prefetch fails
     expect(active).toBe(true);
     expect(state.cache.initialize).toBeDefined();
+  });
+
+  test('returns inactive when all network retries exhausted', async () => {
+    globalThis.fetch = (async () => {
+      throw new Error('ECONNREFUSED');
+    }) as typeof fetch;
+
+    // warmRetries: 1 so attempt 0 retries once, then hits the "retries exhausted" branch
+    const config = makeConfig({ warm: true, warmRetries: 1, warmRetryDelayMs: 50, warmTimeoutMs: 10_000 });
+    const signer = createSigner(config);
+    const state = await warmBackend(config, signer);
+    const active = await state.ready;
+
+    expect(active).toBe(false);
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('failed after'));
+  });
+
+  test('uses synthetic initialize when response body is invalid JSON', async () => {
+    let callCount = 0;
+    globalThis.fetch = (async () => {
+      callCount++;
+      if (callCount === 1) {
+        return new Response('not valid json at all', {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 2, result: {} }), { status: 200 });
+    }) as typeof fetch;
+
+    const config = makeConfig({ warm: true, warmRetries: 0, warmRetryDelayMs: 50, warmTimeoutMs: 10_000 });
+    const signer = createSigner(config);
+    const state = await warmBackend(config, signer);
+    await state.ready;
+
+    // Falls back to synthetic when JSON.parse throws
+    expect(state.cache.initialize).toBeDefined();
+    expect((state.cache.initialize as Record<string, unknown>).protocolVersion).toBeDefined();
   });
 });
 
