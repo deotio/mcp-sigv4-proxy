@@ -655,6 +655,21 @@ describe('processLine', () => {
     expect(output.error.code).toBe(-32000);
   });
 
+  test('emits JSON-RPC error when signing fails', async () => {
+    const config = makeConfig();
+    // Signer with a credential provider that always rejects
+    const badSigner = {
+      sign: async () => { throw new Error('Could not load credentials from any providers'); },
+    } as unknown as ReturnType<typeof createSigner>;
+
+    await processLine('{"jsonrpc":"2.0","method":"test","id":42}', config, badSigner);
+
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('signing failed'));
+    const output = JSON.parse((stdoutSpy.mock.calls[0][0] as string).trim());
+    expect(output.id).toBe(42);
+    expect(output.error.message).toContain('signing failed');
+  });
+
   test('timeout produces specific error message', async () => {
     process.env.AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE';
     process.env.AWS_SECRET_ACCESS_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
@@ -1205,6 +1220,118 @@ describe('warmBackend', () => {
     expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('failed after'));
   });
 
+  test('caches tools/list from SSE prefetch response', async () => {
+    let callCount = 0;
+    globalThis.fetch = (async () => {
+      callCount++;
+      if (callCount === 1) {
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: '__warmup_init__', result: { protocolVersion: '2025-03-26', capabilities: {} } }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      // Return list responses as SSE
+      const result = callCount === 2 ? { tools: [{ name: 'spend' }] } : {};
+      const sseBody = `data: ${JSON.stringify({ jsonrpc: '2.0', id: `list_${callCount}`, result })}\n\n`;
+      return new Response(sseBody, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    }) as typeof fetch;
+
+    const config = makeConfig({ warm: true, warmRetries: 0, warmRetryDelayMs: 50, warmTimeoutMs: 10_000 });
+    const signer = createSigner(config);
+    const state = await warmBackend(config, signer);
+    await state.ready;
+
+    expect(state.cache['tools/list']).toBeDefined();
+    expect((state.cache['tools/list'] as { tools: unknown[] }).tools[0]).toEqual({ name: 'spend' });
+  });
+
+  test('warns when SSE prefetch response has no data: lines', async () => {
+    let callCount = 0;
+    globalThis.fetch = (async () => {
+      callCount++;
+      if (callCount === 1) {
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: '__warmup_init__', result: { protocolVersion: '2025-03-26', capabilities: {} } }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return new Response('event: ping\n\n', { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    }) as typeof fetch;
+
+    const config = makeConfig({ warm: true, warmRetries: 0, warmRetryDelayMs: 50, warmTimeoutMs: 10_000 });
+    const signer = createSigner(config);
+    const state = await warmBackend(config, signer);
+    await state.ready;
+
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('contained no data: lines'));
+  });
+
+  test('warns when SSE prefetch data line is not valid JSON', async () => {
+    let callCount = 0;
+    globalThis.fetch = (async () => {
+      callCount++;
+      if (callCount === 1) {
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: '__warmup_init__', result: { protocolVersion: '2025-03-26', capabilities: {} } }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return new Response('data: not-json\n\n', { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    }) as typeof fetch;
+
+    const config = makeConfig({ warm: true, warmRetries: 0, warmRetryDelayMs: 50, warmTimeoutMs: 10_000 });
+    const signer = createSigner(config);
+    const state = await warmBackend(config, signer);
+    await state.ready;
+
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('SSE data line is not valid JSON'));
+  });
+
+  test('warns when prefetch response has no .result field', async () => {
+    let callCount = 0;
+    globalThis.fetch = (async () => {
+      callCount++;
+      if (callCount === 1) {
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: '__warmup_init__', result: { protocolVersion: '2025-03-26', capabilities: {} } }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 2, error: { message: 'not allowed' } }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    const config = makeConfig({ warm: true, warmRetries: 0, warmRetryDelayMs: 50, warmTimeoutMs: 10_000 });
+    const signer = createSigner(config);
+    const state = await warmBackend(config, signer);
+    await state.ready;
+
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('no .result field'));
+  });
+
+  test('warns when prefetch returns non-ok HTTP status', async () => {
+    let callCount = 0;
+    globalThis.fetch = (async () => {
+      callCount++;
+      if (callCount === 1) {
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: '__warmup_init__', result: { protocolVersion: '2025-03-26', capabilities: {} } }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return new Response('forbidden', { status: 403 });
+    }) as typeof fetch;
+
+    const config = makeConfig({ warm: true, warmRetries: 0, warmRetryDelayMs: 50, warmTimeoutMs: 10_000 });
+    const signer = createSigner(config);
+    const state = await warmBackend(config, signer);
+    await state.ready;
+
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('prefetch'));
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('403'));
+  });
+
   test('uses synthetic initialize when response body is invalid JSON', async () => {
     let callCount = 0;
     globalThis.fetch = (async () => {
@@ -1372,13 +1499,24 @@ describe('integration: log level', () => {
     expect(result.stderr).toBe('');
   });
 
-  test('ERROR is the default (suppresses warnings)', async () => {
+  test('INFO is the default (shows warnings, suppresses debug)', async () => {
     const result = await spawnProxy(
       { ...baseEnv, MCP_LOG_LEVEL: '' },
       { input: ['not json'], timeoutMs: 3000 },
     );
 
-    // "ignoring non-JSON input line" is WARNING level — should not appear
-    expect(result.stderr).not.toContain('ignoring');
+    // "ignoring non-JSON input line" is WARNING level — should appear at INFO default
+    expect(result.stderr).toContain('ignoring');
+    // debug-level request tracing should not appear
+    expect(result.stderr).not.toContain('-> POST');
+  });
+
+  test('unknown MCP_LOG_LEVEL value falls back to default with a warning', async () => {
+    const result = await spawnProxy(
+      { ...baseEnv, MCP_LOG_LEVEL: 'VERBOSE' },
+      { input: [], timeoutMs: 3000 },
+    );
+
+    expect(result.stderr).toContain('unknown MCP_LOG_LEVEL value "VERBOSE"');
   });
 });

@@ -120,6 +120,8 @@ export function validateEnv(): ProxyConfig {
     }
   }
 
+  log('INFO', `v${PROXY_VERSION} starting`);
+
   // Parse timeout
   const timeoutMs = process.env.MCP_TIMEOUT
     ? Number(process.env.MCP_TIMEOUT) * 1000
@@ -672,7 +674,6 @@ export async function handleWarmLine(
 // --- Main entry ---
 
 export function startProxy(): void {
-  log('INFO', `v${PROXY_VERSION} starting`);
   const config = validateEnv();
   const signer = createSigner(config);
   const rl = readline.createInterface({ input: process.stdin, terminal: false });
