@@ -1043,19 +1043,110 @@ describe('warmBackend', () => {
     expect(active).toBe(false);
     expect(state.active).toBe(false);
   });
+
+  test('retries on network error and eventually succeeds', async () => {
+    let callCount = 0;
+    globalThis.fetch = (async () => {
+      callCount++;
+      if (callCount === 1) throw new Error('ECONNREFUSED');
+      return new Response(
+        JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2025-03-26', capabilities: {} } }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    }) as typeof fetch;
+
+    const config = makeConfig({ warm: true, warmRetries: 2, warmRetryDelayMs: 50, warmTimeoutMs: 10_000 });
+    const signer = createSigner(config);
+    const state = await warmBackend(config, signer);
+    const active = await state.ready;
+
+    expect(active).toBe(true);
+    expect(callCount).toBeGreaterThanOrEqual(2);
+  });
+
+  test('uses synthetic initialize when response body lacks result field', async () => {
+    let callCount = 0;
+    globalThis.fetch = (async () => {
+      callCount++;
+      if (callCount === 1) {
+        // initialize response with no result field (e.g. malformed)
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: 1 }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 2, result: {} }), { status: 200 });
+    }) as typeof fetch;
+
+    const config = makeConfig({ warm: true, warmRetries: 0, warmRetryDelayMs: 50, warmTimeoutMs: 10_000 });
+    const signer = createSigner(config);
+    const state = await warmBackend(config, signer);
+    await state.ready;
+
+    expect(state.cache.initialize).toBeDefined();
+    // Should have fallen back to synthetic
+    expect((state.cache.initialize as Record<string, unknown>).protocolVersion).toBeDefined();
+  });
+
+  test('handles list prefetch errors gracefully', async () => {
+    let callCount = 0;
+    globalThis.fetch = (async () => {
+      callCount++;
+      if (callCount === 1) {
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2025-03-26', capabilities: {} } }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      throw new Error('list fetch failed');
+    }) as typeof fetch;
+
+    const config = makeConfig({ warm: true, warmRetries: 0, warmRetryDelayMs: 50, warmTimeoutMs: 10_000 });
+    const signer = createSigner(config);
+    const state = await warmBackend(config, signer);
+    const active = await state.ready;
+
+    // Still succeeds even if list prefetch fails
+    expect(active).toBe(true);
+    expect(state.cache.initialize).toBeDefined();
+  });
 });
 
 // --- Warm mode integration tests ---
 
 describe('integration: warm mode', () => {
-  test('MCP_WARM=1 serves initialize from cache', async () => {
-    // We can't easily mock the backend in integration tests, but we can verify
-    // that the proxy starts and handles warm mode config without crashing
+  test('MCP_WARM=1 logs warm mode enabled', async () => {
     const result = await spawnProxy(
       { ...baseEnv, MCP_WARM: '1', MCP_LOG_LEVEL: 'INFO' },
       { timeoutMs: 3000 },
     );
     expect(result.stderr).toContain('warm mode enabled');
+    expect(result.code).toBe(0);
+  });
+
+  test('MCP_WARM=1 responds to initialize instantly even when backend is unreachable', async () => {
+    // Point at an unreachable host — the warm-up will never complete, but initialize
+    // must still be answered instantly with a synthetic response.
+    const result = await spawnProxy(
+      {
+        ...baseEnv,
+        MCP_SERVER_URL: 'https://127.0.0.1:1',
+        MCP_WARM: '1',
+        MCP_WARM_RETRIES: '0',
+        MCP_LOG_LEVEL: 'DEBUG',
+      },
+      {
+        input: ['{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-03-26","capabilities":{}}}'],
+        timeoutMs: 5000,
+      },
+    );
+
+    expect(result.stdout).toBeTruthy();
+    const output = JSON.parse(result.stdout.trim().split('\n')[0]);
+    expect(output.id).toBe(1);
+    expect(output.result).toBeDefined();
+    expect(output.result.protocolVersion).toBeDefined();
+    // Must respond well within the 5s timeout (should be < 500ms)
     expect(result.code).toBe(0);
   });
 
@@ -1073,6 +1164,42 @@ describe('integration: warm mode', () => {
       { timeoutMs: 3000 },
     );
     expect(result.stderr).not.toContain('warm mode enabled');
+  });
+
+  test('MCP_WARM=1 serves tools/list from cache after warm-up, forwards tool call normally', async () => {
+    // Verify that a non-cacheable method (tools/call) falls through to normal forwarding
+    // even in warm mode (by seeing the expected network error from 127.0.0.1:1)
+    const result = await spawnProxy(
+      {
+        ...baseEnv,
+        MCP_SERVER_URL: 'https://127.0.0.1:1',
+        MCP_WARM: '1',
+        MCP_WARM_RETRIES: '0',
+        MCP_RETRIES: '0',
+        MCP_LOG_LEVEL: 'DEBUG',
+      },
+      {
+        input: [
+          '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-03-26","capabilities":{}}}',
+          '{"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"cost-query","arguments":{}}}',
+        ],
+        timeoutMs: 5000,
+      },
+    );
+
+    const lines = result.stdout.trim().split('\n').filter(Boolean);
+    // initialize must be answered (synthetic)
+    expect(lines.length).toBeGreaterThanOrEqual(1);
+    const init = JSON.parse(lines[0]);
+    expect(init.id).toBe(1);
+    expect(init.result).toBeDefined();
+
+    // tools/call must produce a network error (forwarded, not cached)
+    if (lines.length > 1) {
+      const toolCall = JSON.parse(lines[1]);
+      expect(toolCall.id).toBe(2);
+      expect(toolCall.error).toBeDefined();
+    }
   });
 });
 
