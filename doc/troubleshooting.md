@@ -20,6 +20,20 @@ Something in your environment has set `NODE_TLS_REJECT_UNAUTHORIZED=0`, which di
 
 ## Authentication errors
 
+### `mcp-sigv4-proxy: HTTP 403: {"message":"Credential should be scoped to correct service: 'lambda'."}`
+
+You are using a Lambda Function URL but `AWS_SERVICE` is not set (or is set to `bedrock-agentcore`). The proxy defaults to `bedrock-agentcore` when it can't infer the service from the hostname, and `*.lambda-url.*.on.aws` is not recognized by the inference logic.
+
+**Fix:** Add `AWS_SERVICE=lambda` to your `.mcp.json` `env` block:
+
+```json
+"env": {
+  "AWS_SERVICE": "lambda",
+  "AWS_REGION": "us-east-1",
+  "MCP_SERVER_URL": "https://<id>.lambda-url.us-east-1.on.aws/mcp"
+}
+```
+
 ### `mcp-sigv4-proxy: HTTP 403: {"message":"Credential should be scoped to a valid region."}`
 
 The SigV4 signing region doesn't match what the service expects. This usually happens when `AWS_REGION` from your shell environment (e.g. `eu-central-1` for a different project) leaks into the proxy and overrides the region inferred from the URL.

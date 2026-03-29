@@ -42,7 +42,7 @@ stdin (JSON-RPC) -> validate -> SigV4 sign -> HTTPS POST -> response relay -> st
 | `MCP_SERVER_URL` | yes | — | Full HTTPS URL of the target MCP HTTP endpoint |
 | `AWS_PROFILE` | no | SDK default chain | AWS named profile for signing |
 | `AWS_REGION` | no | inferred from URL, then `us-east-1` | AWS region for SigV4 signing |
-| `AWS_SERVICE` | no | inferred from URL, then `bedrock-agentcore` | SigV4 service name |
+| `AWS_SERVICE` | no | inferred from URL, then `bedrock-agentcore` | SigV4 service name — **set to `lambda` for Lambda Function URLs** |
 | `MCP_TIMEOUT` | no | `180` | Request timeout in seconds |
 | `MCP_RETRIES` | no | `2` | Retry count for 5xx/424 errors and network failures (0-10) |
 | `MCP_LOG_LEVEL` | no | `ERROR` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `SILENT` |

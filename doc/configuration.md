@@ -62,7 +62,13 @@ The AWS service name used in the SigV4 signing process. This determines the sign
 Like `AWS_REGION`, the proxy infers this from the hostname:
 - `bedrock-agentcore.us-east-1.amazonaws.com` -> `bedrock-agentcore`
 
-You only need to set this for non-standard endpoints. Default fallback is `bedrock-agentcore`.
+The default fallback is `bedrock-agentcore` when inference produces no result.
+
+**Lambda Function URLs require explicit `AWS_SERVICE=lambda`.** The `*.lambda-url.*.on.aws` hostname is not recognized by the inference logic, so the proxy falls back to `bedrock-agentcore` and every request returns HTTP 403 with "Credential should be scoped to correct service: 'lambda'". Always set this explicitly for Lambda:
+
+```json
+"AWS_SERVICE": "lambda"
+```
 
 ### `MCP_TIMEOUT` (optional, default: `180`)
 
@@ -221,7 +227,29 @@ The SDK handles the `AssumeRole` call and temporary credential refresh automatic
 
 ## IAM permissions
 
-The IAM principal (user or role) associated with your credentials needs permission to call the target service. For Bedrock AgentCore:
+The IAM principal (user or role) associated with your credentials needs permission to call the target service.
+
+### Lambda Function URL
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunctionUrl",
+      "Resource": "arn:aws:lambda:us-east-1:123456789012:function:your-function-name",
+      "Condition": {
+        "StringEquals": { "lambda:FunctionUrlAuthType": "AWS_IAM" }
+      }
+    }
+  ]
+}
+```
+
+Also set `AWS_SERVICE=lambda` — see the `AWS_SERVICE` section above.
+
+### Bedrock AgentCore
 
 ```json
 {
