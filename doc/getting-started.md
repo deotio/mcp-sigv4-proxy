@@ -25,11 +25,29 @@ aws sso login --profile your-profile-name
 
 ## Step 2: Find your MCP server URL
 
-The URL depends on the service hosting your MCP server. For Bedrock AgentCore, it looks like:
+The URL depends on the service hosting your MCP server.
+
+### Lambda Function URL
+
+Get the URL from the Lambda console, CloudFormation outputs, or the AWS CLI:
+
+```bash
+aws lambda get-function-url-config --function-name your-function-name --profile your-profile-name
+```
+
+The URL looks like:
 
 ```
-https://bedrock-agentcore.<region>.amazonaws.com/runtimes/<runtime-id>/invocations?qualifier=DEFAULT
+https://<id>.lambda-url.<region>.on.aws/
 ```
+
+Append the MCP path (typically `/mcp`) to get the full endpoint:
+
+```
+https://<id>.lambda-url.us-east-1.on.aws/mcp
+```
+
+### Bedrock AgentCore
 
 Get the runtime ID from the AgentCore console or via the AWS CLI:
 
@@ -37,32 +55,38 @@ Get the runtime ID from the AgentCore console or via the AWS CLI:
 aws bedrock-agentcore list-runtimes --profile your-profile-name
 ```
 
-Example output:
-
-```json
-{
-  "agentRuntimeSummaries": [
-    {
-      "agentRuntimeId": "abc123def456",
-      "agentRuntimeName": "my-mcp-server",
-      "status": "READY",
-      "agentRuntimeArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/abc123def456"
-    }
-  ]
-}
-```
-
-Take `agentRuntimeId` from the entry you want and insert it into the URL:
+Take `agentRuntimeId` from the output and insert it into the URL:
 
 ```
-https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/abc123def456/invocations?qualifier=DEFAULT
+https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/<runtime-id>/invocations?qualifier=DEFAULT
 ```
 
-**`?qualifier=DEFAULT`** selects the active deployment of the runtime. `DEFAULT` is the standard alias and is correct in almost all cases; you would only use a different value if you've created a named alias pointing at a specific version.
+**`?qualifier=DEFAULT`** selects the active deployment of the runtime. `DEFAULT` is the standard alias; you would only use a different value if you've created a named alias pointing at a specific version.
 
 ## Step 3: Add to your MCP configuration
 
 Add an entry to your `.mcp.json` file (in your project root or `~/.mcp.json` for global config):
+
+**Lambda Function URL:**
+
+```json
+{
+  "mcpServers": {
+    "my-server": {
+      "command": "npx",
+      "args": ["-y", "@deotio/mcp-sigv4-proxy"],
+      "env": {
+        "AWS_PROFILE": "your-profile-name",
+        "AWS_REGION": "us-east-1",
+        "AWS_SERVICE": "lambda",
+        "MCP_SERVER_URL": "https://<id>.lambda-url.us-east-1.on.aws/mcp"
+      }
+    }
+  }
+}
+```
+
+**Bedrock AgentCore:**
 
 ```json
 {
@@ -80,7 +104,9 @@ Add an entry to your `.mcp.json` file (in your project root or `~/.mcp.json` for
 }
 ```
 
-Always set `AWS_REGION` explicitly — the proxy can infer it from the URL, but your shell's `AWS_REGION` takes precedence and may point to a different region. `AWS_SERVICE` is inferred automatically.
+Always set `AWS_REGION` explicitly — the proxy can infer it from the URL, but your shell's `AWS_REGION` takes precedence and may point to a different region.
+
+**Important:** `AWS_SERVICE` must be set to `lambda` for Lambda Function URLs. For AgentCore, the service is inferred automatically from the hostname.
 
 ## Step 4: Test the connection
 
@@ -95,28 +121,20 @@ mcp-sigv4-proxy: HTTP 403: ...
 mcp-sigv4-proxy: request failed: ...
 ```
 
-## Slow-starting backends (AgentCore cold starts)
+## Slow-starting backends
 
-If your MCP server is hosted on a serverless platform like AWS Bedrock AgentCore Runtime, the first connection may time out because the container takes time to cold-start. Enable warm mode to solve this:
+If your MCP server has slow cold starts (e.g. Bedrock AgentCore Runtime containers can take 60–130 seconds), the MCP client may time out before the backend is ready. Enable warm mode to solve this:
 
 ```json
-{
-  "mcpServers": {
-    "my-server": {
-      "command": "npx",
-      "args": ["-y", "@deotio/mcp-sigv4-proxy"],
-      "env": {
-        "MCP_WARM": "1",
-        "AWS_PROFILE": "your-profile-name",
-        "AWS_REGION": "us-east-1",
-        "MCP_SERVER_URL": "https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/your-runtime-id/invocations?qualifier=DEFAULT"
-      }
-    }
-  }
+"env": {
+  "MCP_WARM": "1",
+  ...
 }
 ```
 
 With `MCP_WARM=1`, the proxy warms the backend in the background at startup and responds to the MCP client instantly from cache. See [Configuration — Warm mode](configuration.md#warm-mode) for details.
+
+**Note:** Lambda Function URLs have 2–5 second cold starts and do not need warm mode.
 
 ## Multiple servers with different profiles
 
@@ -131,7 +149,8 @@ A common use case is connecting to the same MCP server across multiple AWS accou
       "env": {
         "AWS_PROFILE": "dev-account",
         "AWS_REGION": "us-east-1",
-        "MCP_SERVER_URL": "https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/dev-runtime/invocations?qualifier=DEFAULT"
+        "AWS_SERVICE": "lambda",
+        "MCP_SERVER_URL": "https://<dev-id>.lambda-url.us-east-1.on.aws/mcp"
       }
     },
     "finops-prod": {
@@ -140,7 +159,8 @@ A common use case is connecting to the same MCP server across multiple AWS accou
       "env": {
         "AWS_PROFILE": "prod-account",
         "AWS_REGION": "us-east-1",
-        "MCP_SERVER_URL": "https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/prod-runtime/invocations?qualifier=DEFAULT"
+        "AWS_SERVICE": "lambda",
+        "MCP_SERVER_URL": "https://<prod-id>.lambda-url.us-east-1.on.aws/mcp"
       }
     }
   }

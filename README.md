@@ -2,25 +2,42 @@
 
 > **Note:** AWS publishes an official proxy for this use case: [`mcp-proxy-for-aws`](https://github.com/aws/mcp-proxy-for-aws). It is mature, feature-rich, and AWS-supported. **Use it unless you specifically need a Node.js solution.** This package exists for teams that don't have (or want) a Python runtime — it provides the same core functionality as a single `npx` command with zero Python dependencies.
 
-A stdio MCP proxy that signs requests with AWS SigV4 using the standard credential chain. Drop it into your `.mcp.json` as a `command` entry to connect Claude Code (or any MCP client) to IAM-authenticated MCP servers like AWS Bedrock AgentCore — with per-profile auth via `AWS_PROFILE`.
+A stdio MCP proxy that signs requests with AWS SigV4 using the standard credential chain. Drop it into your `.mcp.json` as a `command` entry to connect Claude Code (or any MCP client) to IAM-authenticated MCP servers — Lambda Function URLs, Bedrock AgentCore, or any SigV4-protected HTTP endpoint — with per-profile auth via `AWS_PROFILE`.
 
 ## Quick start
 
-Add to your `.mcp.json`:
+### Lambda Function URL
 
 ```json
-"finops": {
+"my-server": {
   "command": "npx",
   "args": ["-y", "@deotio/mcp-sigv4-proxy"],
   "env": {
-    "AWS_PROFILE": "dot-finops",
+    "AWS_PROFILE": "my-profile",
+    "AWS_REGION": "us-east-1",
+    "AWS_SERVICE": "lambda",
+    "MCP_SERVER_URL": "https://<id>.lambda-url.us-east-1.on.aws/mcp"
+  }
+}
+```
+
+### Bedrock AgentCore
+
+```json
+"my-server": {
+  "command": "npx",
+  "args": ["-y", "@deotio/mcp-sigv4-proxy"],
+  "env": {
+    "AWS_PROFILE": "my-profile",
     "AWS_REGION": "us-east-1",
     "MCP_SERVER_URL": "https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/.../invocations?qualifier=DEFAULT"
   }
 }
 ```
 
-Always set `AWS_REGION` explicitly — the proxy can infer it from standard AWS hostnames, but `AWS_REGION` from your shell environment takes precedence and may point to a different region. `AWS_SERVICE` is inferred automatically and only needs to be set for non-standard endpoints.
+Always set `AWS_REGION` explicitly — the proxy can infer it from standard AWS hostnames, but `AWS_REGION` from your shell environment takes precedence and may point to a different region.
+
+**Important:** `AWS_SERVICE` must be set to `lambda` for Lambda Function URLs. For AgentCore endpoints, it is inferred automatically from the hostname.
 
 ## How it works
 
@@ -50,11 +67,10 @@ stdin (JSON-RPC) -> validate -> SigV4 sign -> HTTPS POST -> response relay -> st
 
 ## Prerequisites
 
-Your AWS profile needs the appropriate IAM permissions for the target service. For Bedrock AgentCore:
+Your AWS profile needs the appropriate IAM permissions for the target service:
 
-```
-bedrock-agentcore:InvokeAgentRuntime
-```
+- **Lambda Function URL**: `lambda:InvokeFunctionUrl`
+- **Bedrock AgentCore**: `bedrock-agentcore:InvokeAgentRuntime`
 
 ## Security
 

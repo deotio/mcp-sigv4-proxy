@@ -64,15 +64,15 @@ The request was signed but the signature doesn't match what the server computed.
 If you're already on 0.2.1+ and still see this error:
 
 - **Clock skew** — SigV4 signatures include a timestamp. If your system clock is off by more than 5 minutes, requests will be rejected. Check with `date` and sync if needed.
-- **Wrong service name** — `AWS_SERVICE` doesn't match what the endpoint expects. Try `bedrock-agentcore` (the default) or `bedrock`.
+- **Wrong service name** — `AWS_SERVICE` doesn't match what the endpoint expects. Use `lambda` for Lambda Function URLs, `bedrock-agentcore` for AgentCore.
 
 ### `mcp-sigv4-proxy: HTTP 403: ...` (other 403 errors)
 
-The request was signed and delivered, but the target service rejected it. Common causes:
+The request was signed and delivered, but the target service rejected it. See the [403 quick-diagnosis checklist](#403-quick-diagnosis-checklist) above, or check these common causes:
 
-- **Wrong IAM permissions** — the principal doesn't have the required action (e.g. `bedrock-agentcore:InvokeAgentRuntime`). Check the IAM policy attached to the user or role.
+- **Wrong IAM permissions** — the principal doesn't have the required action (`lambda:InvokeFunctionUrl` for Lambda, `bedrock-agentcore:InvokeAgentRuntime` for AgentCore). Check the IAM policy attached to the user or role.
 - **Wrong region** — `AWS_REGION` doesn't match the endpoint's region. See the "Credential should be scoped to a valid region" entry above.
-- **Wrong service name** — `AWS_SERVICE` doesn't match what the endpoint expects. Try `bedrock-agentcore` (the default) or `bedrock`.
+- **Wrong service name** — `AWS_SERVICE` doesn't match what the endpoint expects. Use `lambda` for Lambda Function URLs, `bedrock-agentcore` for AgentCore.
 - **Expired credentials** — if using SSO, re-run `aws sso login --profile your-profile`. If using static credentials, verify they haven't been rotated.
 - **Clock skew** — SigV4 signatures include a timestamp. If your system clock is off by more than 5 minutes, requests will be rejected. Check with `date` and sync if needed.
 
@@ -159,6 +159,15 @@ This is expected behavior during warm-up. The backend is still starting and the 
    ```
 
 2. **Test the endpoint independently** — use `awscurl` or a similar tool to make a signed request directly:
+
+   Lambda Function URL:
+   ```bash
+   awscurl --profile your-profile --region us-east-1 --service lambda \
+     -X POST -d '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"capabilities":{}}}' \
+     "https://<id>.lambda-url.us-east-1.on.aws/mcp"
+   ```
+
+   Bedrock AgentCore:
    ```bash
    awscurl --profile your-profile --region us-east-1 --service bedrock-agentcore \
      -X POST -d '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"capabilities":{}}}' \

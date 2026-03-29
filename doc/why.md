@@ -2,7 +2,7 @@
 
 ## The problem
 
-AWS services like Bedrock AgentCore expose MCP servers over HTTP, protected by IAM authentication via SigV4 request signing. MCP clients like Claude Code support two transport modes for connecting to servers:
+AWS services like Lambda Function URLs and Bedrock AgentCore expose MCP servers over HTTP, protected by IAM authentication via SigV4 request signing. MCP clients like Claude Code support two transport modes for connecting to servers:
 
 - **stdio** — the client spawns a local process and communicates over stdin/stdout
 - **http** — the client sends HTTP requests directly to a URL
@@ -20,10 +20,10 @@ Without this proxy, connecting to a SigV4-protected MCP server requires one of:
 `@deotio/mcp-sigv4-proxy` is a stdio-to-HTTP bridge that sits between the MCP client and the IAM-protected server. The client spawns it as a local `command` process (stdio transport), and the proxy handles SigV4 signing transparently:
 
 ```
-┌─────────────┐    stdio     ┌──────────────────┐   signed HTTPS   ┌─────────────────┐
-│  MCP Client  │ ──────────> │  mcp-sigv4-proxy  │ ──────────────> │  MCP Server      │
-│ (Claude Code)│ <────────── │                   │ <────────────── │ (AgentCore, etc) │
-└─────────────┘   JSON-RPC   └──────────────────┘    JSON / SSE    └─────────────────┘
+┌─────────────┐    stdio     ┌──────────────────┐   signed HTTPS   ┌──────────────────────┐
+│  MCP Client  │ ──────────> │  mcp-sigv4-proxy  │ ──────────────> │  MCP Server           │
+│ (Claude Code)│ <────────── │                   │ <────────────── │ (Lambda, AgentCore, …)│
+└─────────────┘   JSON-RPC   └──────────────────┘    JSON / SSE    └──────────────────────┘
 ```
 
 This gives you:
