@@ -20,6 +20,16 @@ Something in your environment has set `NODE_TLS_REJECT_UNAUTHORIZED=0`, which di
 
 ## Authentication errors
 
+### 403 quick-diagnosis checklist
+
+All 403 errors share the same root-cause space. Work through these in order:
+
+1. **Wrong service name** — error says `"scoped to correct service: 'lambda'"` → set `AWS_SERVICE=lambda`. Default is `bedrock-agentcore`.
+2. **Wrong region** — error says `"scoped to a valid region"` → set `AWS_REGION` explicitly in the `env` block to match the endpoint region.
+3. **Signature mismatch** — error says `"signature we calculated does not match"` → check for clock skew (`date`) or upgrade to 0.2.1+ if on an older version.
+4. **Missing IAM permissions** — none of the above → the principal lacks the required action (`bedrock-agentcore:InvokeAgentRuntime`, `lambda:InvokeFunctionUrl`, etc.). Check the IAM policy attached to the user or role.
+5. **Expired credentials** — SSO token expired → re-run `aws sso login --profile your-profile`. Static credentials rotated → update `~/.aws/credentials`.
+
 ### `mcp-sigv4-proxy: HTTP 403: {"message":"Credential should be scoped to correct service: 'lambda'."}`
 
 You are using a Lambda Function URL but `AWS_SERVICE` is not set (or is set to `bedrock-agentcore`). The proxy defaults to `bedrock-agentcore` when it can't infer the service from the hostname, and `*.lambda-url.*.on.aws` is not recognized by the inference logic.

@@ -12,6 +12,8 @@ The full HTTPS URL of the target MCP server endpoint. Must use the `https://` sc
 "MCP_SERVER_URL": "https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/abc123/invocations?qualifier=DEFAULT"
 ```
 
+**`?qualifier=DEFAULT`** selects the active deployment of the runtime. `DEFAULT` is the standard alias; you would only use a different value if you've created a named alias pointing at a specific version.
+
 The proxy validates this at startup and refuses to start if:
 - The variable is missing or empty
 - The URL uses a non-HTTPS scheme (`file://`, `ftp://`, etc.)

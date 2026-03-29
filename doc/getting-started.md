@@ -25,17 +25,40 @@ aws sso login --profile your-profile-name
 
 ## Step 2: Find your MCP server URL
 
-The URL depends on the service hosting your MCP server. For Bedrock AgentCore, it typically looks like:
+The URL depends on the service hosting your MCP server. For Bedrock AgentCore, it looks like:
 
 ```
 https://bedrock-agentcore.<region>.amazonaws.com/runtimes/<runtime-id>/invocations?qualifier=DEFAULT
 ```
 
-You can find it in the AgentCore console or via the AWS CLI:
+Get the runtime ID from the AgentCore console or via the AWS CLI:
 
 ```bash
 aws bedrock-agentcore list-runtimes --profile your-profile-name
 ```
+
+Example output:
+
+```json
+{
+  "agentRuntimeSummaries": [
+    {
+      "agentRuntimeId": "abc123def456",
+      "agentRuntimeName": "my-mcp-server",
+      "status": "READY",
+      "agentRuntimeArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/abc123def456"
+    }
+  ]
+}
+```
+
+Take `agentRuntimeId` from the entry you want and insert it into the URL:
+
+```
+https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/abc123def456/invocations?qualifier=DEFAULT
+```
+
+**`?qualifier=DEFAULT`** selects the active deployment of the runtime. `DEFAULT` is the standard alias and is correct in almost all cases; you would only use a different value if you've created a named alias pointing at a specific version.
 
 ## Step 3: Add to your MCP configuration
 
